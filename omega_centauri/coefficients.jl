@@ -104,7 +104,7 @@ function avg_coef_el(E,L)
     return DE1, DE2, DL1, DL2, DEE, DLL, DEL
 end
 
-"""## Compute orbit averaged coeffs in (E,j) ##
+## Compute orbit averaged coeffs in (E,j) ##
 function avg_coef_ej(E, j)
     # Find Jc, derivatives; J
     Jc = find_Lc(E)[2]
@@ -130,38 +130,6 @@ function avg_coef_ej(E, j)
     DEj   = -(J/(Jc^2))*dJc*DEE_L + (DEL_L/Jc) # Eq 1.75
 
     return DE1, DE2, Dj1, Dj2, DEE, Djj, DEj
-end
-"""
-
-function avg_coef_ej(E, j)
-    try
-        # Find Jc, derivatives; J
-        Jc = find_Lc(E)[2]
-        dJc = dLc_dE(E)
-        d2Jc = d2Lc_dE2(E)
-        J = j * Jc
-
-        # Compute avg diff coeffs in (E,L)
-        DE1_L, DE2_L, DL1_L, DL2_L, DEE_L, DLL_L, DEL_L = avg_coef_el(E, J)
-
-        # Energy coeffs preserved under transformation
-        DE1, DE2, DEE = DE1_L, DE2_L, DEE_L
-
-        # Convert j coeffs -> Eq 1.73, 1.74
-        Dj1_1 = (DL1_L/Jc) - (J/(Jc^2))*dJc*DE1_L - (1/(Jc^2))*dJc*DEL_L
-        Dj1_2 = -(J/2)*((d2Jc/(Jc^2)) - (2*(dJc^2))/(Jc^3))*DEE_L
-        Dj1   = Dj1_1 + Dj1_2
-        Dj2   = (DL2_L/Jc) - (J/(Jc^2))*dJc*DE2_L
-
-        # Diffusion -> No mass dependence
-        Djj = ((J*dJc)/(Jc^2))^2 * DEE_L - 2*(J*dJc/(Jc^3))*DEL_L + (DLL_L/(Jc^2))
-        DEj = -(J/(Jc^2))*dJc*DEE_L + (DEL_L/Jc)
-
-        return DE1, DE2, Dj1, Dj2, DEE, Djj, DEj
-
-    catch
-        return NaN, NaN, NaN, NaN, NaN, NaN, NaN
-    end
 end
 
 ## Compute diff coeff grid (E,j) for sampling ##
@@ -196,6 +164,7 @@ function coef_grid(E_tab,j_tab,res)
     return DE1_tab, DE2_tab, Dj1_tab, Dj2_tab, DEE_tab, Djj_tab, DEj_tab
 end
 
+## Struct to store diff coeffs, functions ##
 struct DiffusionCoeffs
 
     # Orbit-averaged diff coeff grids
