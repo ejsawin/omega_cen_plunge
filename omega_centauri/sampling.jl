@@ -1,13 +1,7 @@
 # --- Distribution Function Sampling --- #
 
-struct SampDF
-    tabr_samp::Vector{Float64}
-    tabv_samp::Vector{Float64}
-    tabn_rv::Matrix{Float64}
-    tabf_rv::Matrix{Float64}
-    N::Function
-    F::Function
-end
+# NOTE: The SampDF struct is defined once in rv_sampling.jl (canonical).
+# rv_sampling.jl must be included before this file so SampDF is available.
 
 ## Calculate (logr, logv) DF, convolve with Gaussian kernel ##
 function kde_rv_df(dat::SnapDat)
