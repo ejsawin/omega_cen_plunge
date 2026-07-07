@@ -68,56 +68,87 @@ function orbit_sample_rv(
     rng = rng_seed === nothing ? Random.default_rng() : MersenneTwister(rng_seed)
 
     # Orbital constants
+    psi_r = psi_calc(r)
+    
+    if !isfinite(psi_r)
+        throw(ArgumentError("psi_calc(r) is not finite at r = $r."))
+    end
+    
     v2_now = vr^2 + vt^2
-    E = 0.5 * v2_now + psi_calc(r)
+    Ekin = 0.5 * v2_now
+    E = Ekin + psi_r
     J = r * abs(vt)
-
+    
     if !(isfinite(E) && isfinite(J))
         throw(ArgumentError(
             "Invalid orbital constants: E = $E, J = $J."
         ))
     end
-
+    
     if J <= 0.0
         throw(ArgumentError(
-            "Angular momentum J = $J is not positive. " 
+            "Angular momentum J = $J is not positive."
         ))
     end
-#=
-    if E >= 0.0
-        throw(ArgumentError(
-            "Orbit appears unbound: E = $E >= 0. " 
-        ))
-    end
-=#
-    if E >= 0.0
-        v_now = sqrt(v2_now)
-        return (rs = fill(r, N_orb), vs = fill(v_now, N_orb))
-    end
-
-    Jc = last(find_Lc(E))
-    #println("E = $E, J = $J, J/Jc = $(J / Jc)")
     
-    # Radial velocity squared
-    radial_vr2_raw(x) = 2.0 * (E - psi_calc(x)) - J^2 / x^2
-
-    radial_vr2(x) = begin
-        y = radial_vr2_raw(x)
-
+    # This is currently unused, so do not evaluate it unnecessarily.
+    # Jc = last(find_Lc(E))
+    
+    # Use the equivalent but more numerically stable expression:
+    #
+    # vr^2(x) = v_now^2 + 2 * [psi(r) - psi(x)] - (J / x)^2
+    #
+    # rather than 2 * (E - psi(x)) - J^2 / x^2.
+    function radial_vr2_eval(x::Float64)
+        if !(isfinite(x) && x > 0.0)
+            return (NaN, NaN, NaN)
+        end
+    
+        psi_x = psi_calc(x)
+    
+        if !isfinite(psi_x)
+            return (psi_x, psi_x, NaN)
+        end
+    
+        centrifugal = (J / x)^2
+    
+        # Enforce the exact known value at the supplied phase-space point.
+        y = if x == r
+            vr^2
+        else
+            v2_now + 2.0 * (psi_r - psi_x) - centrifugal
+        end
+    
+        return (y, psi_x, centrifugal)
+    end
+    
+    radial_vr2_raw(x::Float64) = first(radial_vr2_eval(x))
+    
+    function radial_vr2(x::Float64)
+        y, psi_x, centrifugal = radial_vr2_eval(x)
+    
         if !isfinite(y)
             return y
         end
-
-        # Treat tiny numerical negatives/positives near a turning point as zero.
-        if abs(y) < tol
-            return 0.0
-        end
-
-        return y
+    
+        # Scale-aware tolerance: the potential/energy terms can be ~10^6,
+        # even when the physical radial velocity squared is nearly zero.
+        scale = max(
+            1.0,
+            abs(v2_now),
+            abs(2.0 * psi_r),
+            abs(2.0 * psi_x),
+            abs(centrifugal),
+        )
+    
+        local_tol = max(tol, 16.0 * eps(Float64) * scale)
+    
+        # Treat tiny roundoff-level values near a turning point as zero.
+        return abs(y) <= local_tol ? 0.0 : y
     end
-
+    
     vr2_now = radial_vr2(r)
-
+    
     if !(isfinite(vr2_now)) || vr2_now < 0.0
         throw(ArgumentError(
             "Current point is not inside the allowed radial region: " *
@@ -125,7 +156,6 @@ function orbit_sample_rv(
             "radial_vr2(r) = $vr2_now."
         ))
     end
-
     # bisection root finder
     function bisect_root(f, a, b)
         fa = f(a)

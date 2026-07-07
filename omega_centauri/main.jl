@@ -9,6 +9,7 @@ using DataFrames
 using Statistics
 using QuadGK
 using Plots
+using Random
 
 include("constants.jl")
 include("data_io.jl")
@@ -24,7 +25,8 @@ include("orbits.jl")
 include("gw_experiment.jl")
 
 # Read in file
-dat = read_file("omegaCenEddieNew.csv")
+#dat = read_file("omegaCenEddieNew.csv")
+dat = read_file("~/ToProject/Omega_Cen_Plunge/1Gyr.csv")
 
 # Compute potential 
 psi_tab, psi_tot_tab, M_tab = find_psi_arrays(dat.r,dat.m)
@@ -38,7 +40,4 @@ m_obj = 5e-6
 rho = rho_calc(DF,dat)
 
 # Read in diffusion coefficients
-coef = load_coeffs("kde_coeffs.hdf5")
-
-Etab = 0.5 .* (dat.vr.^2 .+ dat.vt.^2) .+ psi_calc.(dat.r)
-Ltab = dat.r .* dat.vt
+coef = load_coeffs("Jun_10_expanded_adap_sp_forplot.hdf5")

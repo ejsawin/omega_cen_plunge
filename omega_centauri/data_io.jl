@@ -25,6 +25,7 @@ end
 function read_file(filename::String)
 
     # Read data into DF
+    filename = expanduser(filename)
     df = CSV.read(filename, DataFrame)
 
     # Extract columns

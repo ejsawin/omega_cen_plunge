@@ -40,33 +40,45 @@ function vel_coef(r,E,L)
 end
 
 ## Calculate local (E,L) diff coeffs ##
-function loc_coef(r,E,L)
+function loc_coef(r, E, L)
+
+    if r < 0
+        @warn "loc_coef received negative r; using abs(r) for calculation" E L r
+        r = abs(r)
+    elseif r == 0
+        throw(DomainError(r, "loc_coef received r = 0, cannot take log(r)."))
+    end
 
     # Object total velocity
-    vel = sqrt(find_vr(r,E,L) ^ 2 + find_vt(r,E,L) ^ 2)
+    vel = sqrt(find_vr(r, E, L)^2 + find_vt(r, E, L)^2)
 
     logr = log(r) # Convert into log space
     log_vel = log(vel)
 
     # Vel diff coefs
-    vp1, vp2, vp_sq, vt_sq = vel_coef(r,E,L)
+    vp1, vp2, vp_sq, vt_sq = vel_coef(r, E, L)
 
     # 1st order coefs split, 2nd order unchanged
-    delE1 = 0.5 * (vp_sq + vt_sq) + vel*vp1 # Eq 1.55
+    delE1 = 0.5 * (vp_sq + vt_sq) + vel * vp1 # Eq 1.55
     delE2 = vel * vp2 # Mass dependent 
 
-    delL1 = (L / vel) * vp1 + (r ^ 2) / (4 * L) * vt_sq # Eq 1.57
+    delL1 = (L / vel) * vp1 + (r^2) / (4 * L) * vt_sq # Eq 1.57
     delL2 = (L / vel) * vp2 # Mass dependent
 
-    delE_sq = vel ^ 2 * vp_sq # Eq 1.56
-    delL_sq = (L ^ 2 / vel ^ 2) * vp_sq + 0.5*(r^2 - L^2 / vel^2) * vt_sq # Eq 1.58
+    delE_sq = vel^2 * vp_sq # Eq 1.56
+    delL_sq = (L^2 / vel^2) * vp_sq + 0.5 * (r^2 - L^2 / vel^2) * vt_sq # Eq 1.58
     delEL = L * vp_sq # Eq 1.59
 
     return delE1, delE2, delL1, delL2, delE_sq, delL_sq, delEL
 end
 
+
 ## Calculate orbit averaged (E,L) diff coeffs ##
 function avg_coef_el(E,L)
+
+    if E > 0
+        return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+    end
     
     # Calculate orbit turning points, period
     rp, ra = find_rp_ra(E,L)
@@ -164,7 +176,6 @@ function coef_grid(E_tab,j_tab,res)
     return DE1_tab, DE2_tab, Dj1_tab, Dj2_tab, DEE_tab, Djj_tab, DEj_tab
 end
 
-## Struct to store diff coeffs, functions ##
 struct DiffusionCoeffs
 
     # Orbit-averaged diff coeff grids
@@ -197,15 +208,24 @@ function generate_coeffs(res)
 
     # Calculate energy (& limits) for snapshot 
     EE = 0.5 .* (dat.vr.^2 .+ dat.vt.^2) .+ psi_calc.(dat.r)
-    emin, emax = extrema(EE[EE .< 0])
+    #emin, emax = extrema(EE[(EE .< 0) .& (dat.startype .== 14)])
+    emin, emax = extrema(EE[(EE .< 0) .& (dat.startype .> -100)])
 
-    # Sampling grid for E,j 
-    E_tab = range(emin,emax,res)
-    j_tab = range(1e-5,0.99999,res)
-
-    # Compute coeffs over grid 
+    j_min = 1e-3
+    j_max = 0.999
+    
+    j_edges = 10 .^ range(log10(j_min), log10(j_max), length=res + 1)
+    
+    # Geometric centers of the log bins
+    j_tab = sqrt.(j_edges[1:end-1] .* j_edges[2:end])
+    
+    E_abs_edges = 10 .^ range(log10(0.1), log10(abs(emin)), length=res + 1)
+    
+    E_edges = reverse(-E_abs_edges)
+    E_tab = reverse(-sqrt.(E_abs_edges[1:end-1] .* E_abs_edges[2:end]))
+        
     (DE1_tab, DE2_tab, Dj1_tab, Dj2_tab, 
-     DEE_tab, Djj_tab, DEj_tab) = coef_grid(E_tab,j_tab,res)
+         DEE_tab, Djj_tab, DEj_tab) = coef_grid(E_tab,j_tab,res)
 
     # Bilinear interpolation
     interp(Z) = (j,E) -> bilinear_interp(j, E, j_tab, E_tab, Z)
