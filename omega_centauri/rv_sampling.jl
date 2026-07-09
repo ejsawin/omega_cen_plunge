@@ -64,6 +64,11 @@ function orbit_sample_rv(
         throw(ArgumentError("expand_factor must be larger than 1."))
     end
 
+    # N_orb == 1: return the input point directly (no orbit sampling).
+    if N_orb == 1
+        return (rs = fill(r, 1), vs = fill(sqrt(vr^2 + vt^2), 1))
+    end
+
     # RNG
     rng = rng_seed === nothing ? Random.default_rng() : MersenneTwister(rng_seed)
 
