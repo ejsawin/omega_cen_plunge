@@ -8,7 +8,7 @@ const c = 4570.33
 const b = 3*pi/16 # Normalized to Virial radius 
 
 ## Numerical constants ##
-const n_steps = 2872 # Integration sampling points
+const n_steps = 2872 # Integration sampling points, does not impact new integrals
 const tol = 1e-12 # Root finding
 const lc_tol = 1e-8 # Lc buffer for rp, ra finding 
 const maxiter = 100 # Max iterations (bisection)
@@ -25,3 +25,5 @@ const dj=0.005
 
 const dlogE=0.005 # Grid size (DF Sampling - Log (E,j))
 const dlogj=0.005
+
+const psi_nbins = 10000000 # Log-r bins for orbit-sampled potential
