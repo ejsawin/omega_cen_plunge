@@ -3,17 +3,17 @@
 ## Calculate rc, Lc via effective potential ##
 function find_Lc(E)
 
-    N = length(dat.r)
+    N = length(psi_rtab)
 
     # psi(r) + (L^2)/(2*r^2) = E -> L^2 = eta = 2*r^2*(E-psi(r))
 
     # Value at leftmost two points
-    eta_1 = 2*dat.r[1]^2 * (E - psi_tot_tab[1])
-    eta_2 = 2*dat.r[2]^2 * (E - psi_tot_tab[2])
+    eta_1 = 2*psi_rtab[1]^2 * (E - psi_tot_tab[1])
+    eta_2 = 2*psi_rtab[2]^2 * (E - psi_tot_tab[2])
 
     # Value at rightmost two points
-    eta_N1 = 2*dat.r[N-1]^2 * (E - psi_tot_tab[N-1])
-    eta_N = 2*dat.r[N]^2 * (E - psi_tot_tab[N])
+    eta_N1 = 2*psi_rtab[N-1]^2 * (E - psi_tot_tab[N-1])
+    eta_N = 2*psi_rtab[N]^2 * (E - psi_tot_tab[N])
 
     # Starting left, right indices
     il = 1
@@ -30,8 +30,8 @@ function find_Lc(E)
             # Calculate eta, slope at midpoint
             im = div(il + ir, 2)
 
-            eta_m = 2*dat.r[im]^2 * (E - psi_tot_tab[im])
-            eta_m1 = 2*dat.r[im+1]^2 * (E - psi_tot_tab[im+1])
+            eta_m = 2*psi_rtab[im]^2 * (E - psi_tot_tab[im])
+            eta_m1 = 2*psi_rtab[im+1]^2 * (E - psi_tot_tab[im+1])
 
             del_eta_m = eta_m1 - eta_m
 
@@ -51,8 +51,8 @@ function find_Lc(E)
         end
 
         # Linear interpolation (left bracket)
-        rl = dat.r[il]
-        rl1 = dat.r[il+1]
+        rl = psi_rtab[il]
+        rl1 = psi_rtab[il+1]
 
         psil = psi_tot_tab[il]
         psil1 = psi_tot_tab[il+1]
@@ -62,8 +62,8 @@ function find_Lc(E)
         rsol_l = 0.5 * 1/((E-psil)/slopel + 1/rl)
 
         # Linear interpolation (right bracket)
-        rr = dat.r[ir]
-        rr1 = dat.r[ir+1]
+        rr = psi_rtab[ir]
+        rr1 = psi_rtab[ir+1]
 
         psir = psi_tot_tab[ir]
         psir1 = psi_tot_tab[ir+1]
@@ -90,8 +90,8 @@ function find_Lc(E)
             psi = psi_tab[1] - G * M_bh / rsol
 
         else # Maximum in [r1, r2] -> Linear interpolation
-            r1 = dat.r[1]
-            r2 = dat.r[2]
+            r1 = psi_rtab[1]
+            r2 = psi_rtab[2]
 
             psi1 = psi_tot_tab[1]
             psi2 = psi_tot_tab[2]
@@ -107,13 +107,13 @@ function find_Lc(E)
     else # if del_eta_r > 0
 
         if eta_N > eta_N1 # rc > rN -> Analytic soln
-            Mtot = sum(dat.m) + M_bh # total mass
+            Mtot = psi_Mtot + M_bh # total mass
             rsol = -(G*Mtot)/(2*E)
             psi = -(G*Mtot)/rsol
 
         else # Maximum in [rN-1,rN] -> Linear interpolation
-            rN1 = dat.r[N-1]
-            rN = dat.r[N]
+            rN1 = psi_rtab[N-1]
+            rN = psi_rtab[N]
 
             psi_N1 = psi_tot_tab[N-1]
             psi_N = psi_tot_tab[N]

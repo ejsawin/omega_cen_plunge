@@ -82,13 +82,13 @@ psi_exact(r_tab, psi_arr, M_arr) = rr -> find_psi_exact(rr, r_tab, psi_arr, M_ar
 
 ## Effective potential ##
 function psi_eff(r,L)
-    N = length(dat.r)
-    Mtot = sum(dat.m) + M_bh
+    N = length(psi_rtab)
+    Mtot = psi_Mtot + M_bh
 
-    if r < dat.r[1] # r < r1 -> Analytic
+    if r < psi_rtab[1] # r < r1 -> Analytic
         return -G*M_bh/r + psi_tab[1] + (L^2)/(2*r^2)
 
-    elseif r > dat.r[N] # r > rN -> Keplerian
+    elseif r > psi_rtab[N] # r > rN -> Keplerian
         return -(G*Mtot)/r + (L^2)/(2*r^2)
 
     else # r1 < r < rN

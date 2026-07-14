@@ -47,20 +47,21 @@ function mc_step(E,j,coef,m_obj)
     dE_tot = dE_NR + dE_GW
     dj_tot = dj_NR + dj_GW
 
-    # Adaptive timestep (Qunbar & Stone)
-    F_safe = 50
+    # Step Size
+    MCResolution = 10000   # resolution knob: step is 1/MCResolution of the diffusion timescale
+    F_safe = 1            # physics floor: timestep must exceed F_safe orbital periods
 
-    gw_term = E / dE_GW 
+    gw_term = E / dE_GW
 #    nr_term = sqrt((j^2) / (djj_NR * period))
     nr_term = sqrt((j^2) / (djj_NR))
 
 
-    
-    N_safe = (1/F_safe) * min(gw_term, nr_term) # Choose smaller timestep
+
+    N_safe = (1/MCResolution) * min(gw_term, nr_term) # Choose smaller timestep
 #    println("GW: $gw_term, NR: $nr_term")
 #    N_orb = max(1.0, N_safe)
-#    dt = N_orb * period 
-    dt = max(N_safe,period)
+#    dt = N_orb * period
+    dt = max(N_safe, F_safe * period)
 
     denom = sqrt(abs(dEE_NR * djj_NR))
 
@@ -102,6 +103,18 @@ function mc_step(E,j,coef,m_obj)
     
 end
 
+## Reflecting boundary: single reflection at j = 0 and j = 1 (for j in [-1, 2]) ##
+function reflect_j(j)
+    if j < 0.0
+        return -j       # reflect at j = 0
+    elseif j > 1.0
+        return 2.0 - j  # reflect at j = 1
+    else
+        return j
+    end
+end
+
+
 function run_mc(E0, j0, coef, m_obj; max_step=100, max_t=Inf)
 
     # Initialize storage arrays
@@ -118,18 +131,23 @@ function run_mc(E0, j0, coef, m_obj; max_step=100, max_t=Inf)
     for step in 1:max_step
         j_lc = loss_cone(E)
 
-        if E <= -10000000
-            println("Below potential minimum: (E = $E)")
-            break
-        elseif j <= j_lc
+        if j <= j_lc
             println("Entered loss cone (j = $j, j_lc = $j_lc)")
             break
-        elseif j >= 1.0 || E >= 0.0 || t >= max_t
+        elseif E >= 0.0 || t >= max_t
             break
         end
 
         E, j, dt = mc_step(E,j,coef,m_obj)
-        j = clamp(j, 0.0, 1.0) # Ensure physical j
+
+        # Pathological step (Inf/NaN or j far outside [0, 1]) -> end this
+        # walker; the batch continues with the next black hole.
+        if !isfinite(j) || j < -1.0 || j > 2.0
+            println(stderr, "WARNING: pathological j = $j (E = $E) at step $step; ending walker early.")
+            break
+        end
+
+        j = reflect_j(j) # Reflecting boundary at j = 0 and j = 1
         t += dt
         n += 1
 
@@ -160,22 +178,45 @@ function run_mc_rp_ra(E0, j0, coef, m_obj; max_step=100, max_t=Inf)
     # Initial values 
     E, j, t = E0, j0, 0.0
     n = 1
+    reason = 3   # default: reached max_step
 
     for step in 1:max_step
         j_lc = loss_cone(E)
 
         if E <= -10000000
+            reason = -100
             println("Below potential minimum: (E = $E)")
             break
         elseif j <= j_lc
+            reason = 1
             println("Entered loss cone (j = $j, j_lc = $j_lc)")
             break
-        elseif j >= 1.0 || E >= 0.0 || t >= max_t
+        elseif E >= 0.0
+            reason = -100
+            break
+        elseif t >= max_t
+            reason = 2
             break
         end
 
         E, j, dt = mc_step(E,j,coef,m_obj)
-        j = clamp(j, 0.0, 1.0) # Ensure physical j
+
+        # Diffused out of the bound region (E >= 0) -> object escaped; end
+        # walker. find_Lc for E >= 0 would otherwise give j = L/Lc = -Inf.
+        if E >= 0.0
+            reason = -100
+            break
+        end
+
+        # Pathological step (Inf/NaN or j far outside [0, 1]) -> end this
+        # walker; the batch continues with the next black hole.
+        if !isfinite(j) || j < -1.0 || j > 2.0
+            reason = -100
+            println(stderr, "WARNING: pathological j = $j (E = $E) at step $step; ending walker early.")
+            break
+        end
+
+        j = reflect_j(j) # Reflecting boundary at j = 0 and j = 1
         t += dt
         n += 1
 
@@ -184,10 +225,10 @@ function run_mc_rp_ra(E0, j0, coef, m_obj; max_step=100, max_t=Inf)
         
         rp, ra = find_rp_ra(E, j*Lc)
         rp_stor[n], ra_stor[n] = rp, ra
-        println("E = $E, j = $j, t = $t, rp = $rp, ra = $ra")
+        #println("E = $E, j = $j, t = $t, rp = $rp, ra = $ra")
     end
 
-    return 0.07453 .* t_stor[1:n], E_stor[1:n], j_stor[1:n], rp_stor[1:n], ra_stor[1:n]
+    return 0.07453 .* t_stor[1:n], E_stor[1:n], j_stor[1:n], rp_stor[1:n], ra_stor[1:n], reason
 end
 
 
@@ -196,4 +237,51 @@ function loss_cone(E)
     J_icbo = (4 * G * M_bh) / c
     Jc = last(find_Lc(E))
     return J_icbo / Jc
+end
+
+
+## Loss-cone boundary j_lc(E) on a log-spaced |E| grid (for plotting the curve) ##
+function loss_cone_curve(; Emin_abs = 0.01, Emax_abs = 1.0e7, nbins = 300)
+    E_abs = 10.0 .^ range(log10(Emin_abs), log10(Emax_abs), length = nbins)
+    lcE = -E_abs                          # bound energies (negative): -0.1 .. -1e6
+    lcJ = [loss_cone(E) for E in lcE]     # normalized loss-cone j via find_Lc
+    return lcE, lcJ
+end
+
+
+## (E, L, j) for a phase-space point using the current global potential ##
+function ej_from_phase(r, vr, vt)
+    E = 0.5 * (vr^2 + vt^2) + psi_calc(r)
+    L = r * vt
+
+    if E >= 0.0
+        return E, L, NaN            # unbound orbit: j undefined
+    end
+
+    Lc = last(find_Lc(E))
+    return E, L, L / Lc
+end
+
+
+## Initial (E, j, mass) for every bound black hole (startype == 14) in a snapshot ##
+function black_hole_ics(dat; startype = 14)
+
+    inds = Int[]
+    E0s  = Float64[]
+    J0s  = Float64[]
+    m0s  = Float64[]
+
+    for i in eachindex(dat.startype)
+        dat.startype[i] == startype || continue     # target type only
+
+        E, L, j = ej_from_phase(dat.r[i], dat.vr[i], dat.vt[i])
+        isfinite(j) || continue                      # skip unbound
+
+        push!(inds, i)
+        push!(E0s, E)
+        push!(J0s, reflect_j(j))                     # keep j0 within [0, 1]
+        push!(m0s, dat.m[i])                         # each BH uses its own mass
+    end
+
+    return (indices = inds, E0 = E0s, J0 = J0s, m0 = m0s)
 end

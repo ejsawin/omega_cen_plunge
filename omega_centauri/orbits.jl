@@ -46,7 +46,7 @@ end
 
 # ra > rN: -GMtot/r + (L^2)/(2*r^2) = E
 function anal_ra(E,L) 
-    GMtot = G * (sum(dat.m) + M_bh)
+    GMtot = G * (psi_Mtot + M_bh)
     return (GMtot + sqrt(GMtot ^ 2 + 2 * E * L^2))/(-2*E)
 end
 
@@ -60,10 +60,10 @@ function find_rmin(L)
         return nothing
     end
 
-    N = length(dat.r)
+    N = length(psi_rtab)
 
     # Helper functions
-    psi_eff_tab(i) = psi_tot_tab[i] + (L^2) / (2 * dat.r[i]^2)
+    psi_eff_tab(i) = psi_tot_tab[i] + (L^2) / (2 * psi_rtab[i]^2)
     del_psi(i) = psi_eff_tab(i+1) - psi_eff_tab(i)
 
     # Check if minimum bracketed 
@@ -87,11 +87,11 @@ function find_rmin(L)
         elseif del_psi(im) < 0 # Minimum to right 
             il = im
         else
-            return dat.r[im] # Found minimum!
+            return psi_rtab[im] # Found minimum!
         end
     end
 
-    return dat.r[ir] # Return minimum
+    return psi_rtab[ir] # Return minimum
 end
 
 ## Calculate orbital turning points via effective potential ##
@@ -115,7 +115,7 @@ function find_rp_ra(E, L)
     end
 
     f(r) = psi_eff(r, L) - E
-    N = length(dat.r)
+    N = length(psi_rtab)
 
     rmin = find_rmin(L)
 
@@ -125,20 +125,20 @@ function find_rp_ra(E, L)
     end
 
     if isnothing(rmin) # Minimum off grid 
-        psi_eff_tab(i) = psi_tot_tab[i] + (L^2) / (2 * dat.r[i]^2)
+        psi_eff_tab(i) = psi_tot_tab[i] + (L^2) / (2 * psi_rtab[i]^2)
         del_psi(i) = psi_eff_tab(i + 1) - psi_eff_tab(i)
 
         if del_psi(1) > 0
             rp = anal_rp(E, L)
-            if f(dat.r[N]) > 0
-                ra = bisect(f, rc, dat.r[N])
+            if f(psi_rtab[N]) > 0
+                ra = bisect(f, rc, psi_rtab[N])
             else
                 ra = anal_ra(E, L)
             end
         elseif del_psi(N - 1) < 0
             ra = anal_ra(E, L)
-            if f(dat.r[1]) > 0 && f(rc) < 0
-                rp = bisect(f, dat.r[1], rc)
+            if f(psi_rtab[1]) > 0 && f(rc) < 0
+                rp = bisect(f, psi_rtab[1], rc)
             else
                 rp = anal_rp(E, L)
             end
@@ -146,17 +146,17 @@ function find_rp_ra(E, L)
 
     else
         # Find rp
-        if f(dat.r[1]) < 0
+        if f(psi_rtab[1]) < 0
             rp = anal_rp(E, L)
         else
-            rp = bisect(f, dat.r[1], rmin)
+            rp = bisect(f, psi_rtab[1], rmin)
         end
 
         # Find ra
-        if f(dat.r[N]) < 0
+        if f(psi_rtab[N]) < 0
             ra = anal_ra(E, L)
         else
-            ra = bisect(f, rmin, dat.r[N])
+            ra = bisect(f, rmin, psi_rtab[N])
         end
     end
     return rp, ra
@@ -212,12 +212,12 @@ const ORBIT_FAIL = (-100.0, -100.0)
 # -------------------------------------------------------------------
 # "Virtual" extension of the potential outside the original r grid.
 #
-# Below dat.r[1], assume the force is purely Keplerian from the BH.
+# Below psi_rtab[1], assume the force is purely Keplerian from the BH.
 # The contribution from exterior spherical mass is a constant offset.
 # -------------------------------------------------------------------
 
 @inline function inner_psi0()
-    r1 = dat.r[1]
+    r1 = psi_rtab[1]
     GM = G * M_bh
 
     # Makes psi_inner(r1) exactly match psi_tot_tab[1].
@@ -231,8 +231,8 @@ function psi_orbit(r)
         return NaN
     end
 
-    r1 = dat.r[1]
-    rN = dat.r[end]
+    r1 = psi_rtab[1]
+    rN = psi_rtab[end]
 
     if r < r1
         # Inner extension: constant offset + Keplerian BH potential.
@@ -240,7 +240,7 @@ function psi_orbit(r)
 
     elseif r > rN
         # Outer extension, consistent with anal_ra.
-        return -G * (sum(dat.m) + M_bh) / r
+        return -G * (psi_Mtot + M_bh) / r
 
     else
         return psi_calc(r)
@@ -266,7 +266,7 @@ function find_Lc_orbit(E)
     if isfinite(Ein) && Ein < 0
         rc_kep = -GM / (2 * Ein)
 
-        if rc_kep < dat.r[1]
+        if rc_kep < psi_rtab[1]
             Lc_kep = GM / sqrt(-2 * Ein)
             return rc_kep, Lc_kep
         end
@@ -348,7 +348,7 @@ function anal_ra(E, L)
         return nothing
     end
 
-    GMtot = G * (sum(dat.m) + M_bh)
+    GMtot = G * (psi_Mtot + M_bh)
     disc2 = GMtot^2 + 2 * E * L^2
 
     if !isfinite(disc2) || disc2 < 0
@@ -370,9 +370,9 @@ function find_rmin(L)
         return nothing
     end
 
-    N = length(dat.r)
+    N = length(psi_rtab)
 
-    psi_eff_tab(i) = psi_tot_tab[i] + L^2 / (2 * dat.r[i]^2)
+    psi_eff_tab(i) = psi_tot_tab[i] + L^2 / (2 * psi_rtab[i]^2)
     del_psi(i) = psi_eff_tab(i + 1) - psi_eff_tab(i)
 
     # Minimum is not bracketed by the tabulated r grid.
@@ -392,11 +392,11 @@ function find_rmin(L)
         elseif del_psi(im) < 0
             il = im
         else
-            return dat.r[im]
+            return psi_rtab[im]
         end
     end
 
-    return dat.r[ir]
+    return psi_rtab[ir]
 end
 
 
@@ -408,7 +408,7 @@ function find_rp_ra(E, L)
             return ORBIT_FAIL
         end
 
-        N = length(dat.r)
+        N = length(psi_rtab)
 
         rc, Lc = find_Lc_orbit(E)
         
@@ -430,7 +430,7 @@ function find_rp_ra(E, L)
         end
 
         # Important change:
-        # f now works below dat.r[1] and above dat.r[end].
+        # f now works below psi_rtab[1] and above psi_rtab[end].
         f(r) = psi_eff_orbit(r, L) - E
 
         rmin = find_rmin(L)
@@ -446,7 +446,7 @@ function find_rp_ra(E, L)
 
         if isnothing(rmin)
 
-            psi_eff_tab(i) = psi_tot_tab[i] + L^2 / (2 * dat.r[i]^2)
+            psi_eff_tab(i) = psi_tot_tab[i] + L^2 / (2 * psi_rtab[i]^2)
             del_psi(i) = psi_eff_tab(i + 1) - psi_eff_tab(i)
 
             # Effective-potential minimum is below the inner r grid.
@@ -454,9 +454,9 @@ function find_rp_ra(E, L)
 
                 rp = anal_rp(E, L)
 
-                if f(dat.r[N]) > 0
-                    # rc may be below dat.r[1], but f is now valid there.
-                    ra = bisect(f, rc, dat.r[N])
+                if f(psi_rtab[N]) > 0
+                    # rc may be below psi_rtab[1], but f is now valid there.
+                    ra = bisect(f, rc, psi_rtab[N])
                 else
                     ra = anal_ra(E, L)
                 end
@@ -466,9 +466,9 @@ function find_rp_ra(E, L)
 
                 ra = anal_ra(E, L)
 
-                if f(dat.r[1]) > 0 && f(rc) < 0
-                    # rc may be beyond dat.r[end], but f is valid there too.
-                    rp = bisect(f, dat.r[1], rc)
+                if f(psi_rtab[1]) > 0 && f(rc) < 0
+                    # rc may be beyond psi_rtab[end], but f is valid there too.
+                    rp = bisect(f, psi_rtab[1], rc)
                 else
                     rp = anal_rp(E, L)
                 end
@@ -476,17 +476,17 @@ function find_rp_ra(E, L)
 
         else
             # Find rp
-            if f(dat.r[1]) < 0
+            if f(psi_rtab[1]) < 0
                 rp = anal_rp(E, L)
             else
-                rp = bisect(f, dat.r[1], rmin)
+                rp = bisect(f, psi_rtab[1], rmin)
             end
 
             # Find ra
-            if f(dat.r[N]) < 0
+            if f(psi_rtab[N]) < 0
                 ra = anal_ra(E, L)
             else
-                ra = bisect(f, rmin, dat.r[N])
+                ra = bisect(f, rmin, psi_rtab[N])
             end
         end
 

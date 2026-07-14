@@ -12,6 +12,9 @@ end
 
 using Random
 
+# Orbit-sampled potential, populated by orbit_sampled_kde_rv_df (see save_psi_grids).
+const ORBIT_PSI = Ref{Any}(nothing)
+
 ## Orbit sampling in (r, v)
 ##
 ## Input:
@@ -83,6 +86,11 @@ function orbit_sample_rv(
     Ekin = 0.5 * v2_now
     E = Ekin + psi_r
     J = r * abs(vt)
+
+    # Unbound orbit (E >= 0): no closed orbit to sample -> failed, ignore.
+    if E >= 0.0
+        return nothing
+    end
     
     if !(isfinite(E) && isfinite(J))
         throw(ArgumentError(
@@ -437,6 +445,17 @@ function orbit_sampled_kde_rv_df(
     # Each orbit sample gets weight 1/N_orb
     w = 1.0 / N_orb
 
+    # Orbit-sampled potential: log-r grid from the IMBH scale to the outermost
+    # particle. r_lo = IMBH gravitational radius; r_hi = furthest particle.
+    r_lo_psi  = G * M_bh / c^2
+    r_hi_psi  = dat.rmax
+    logr_lo   = log(r_lo_psi)
+    dlogr_psi = (log(r_hi_psi) - logr_lo) / psi_nbins
+
+    # Per-thread radial mass profile (reduced after the loop).
+    n_threads       = Threads.maxthreadid()
+    tab_m_r_threads = zeros(Float64, psi_nbins, n_threads)
+
 
     orbit_counter = Threads.Atomic{Int}(0)
     t_start = time()
@@ -458,7 +477,10 @@ function orbit_sampled_kde_rv_df(
             psi_calc;
             rng_seed = particle_seed,
         )
-    
+
+        # Unbound / failed orbit: ignore this particle.
+        samples === nothing && continue
+
         done = Threads.atomic_add!(orbit_counter, 1) + 1
         if done % 10000 == 0
             elapsed = time() - t_start
@@ -490,8 +512,29 @@ function orbit_sampled_kde_rv_df(
                 @inbounds tabn_rv[ir,iv] += mass * w / (dlogr * dlogv)
                 @inbounds tabf_rv[ir,iv] += mass^2 * w / (dlogr * dlogv)
             end
+
+            # Accumulate mass onto the orbit-sampled potential grid; ignore
+            # samples below the IMBH scale or beyond the outermost particle.
+            ir_psi = floor(Int64, (log(rs) - logr_lo) / dlogr_psi) + 1
+            if 1 <= ir_psi <= psi_nbins
+                @inbounds tab_m_r_threads[ir_psi, Threads.threadid()] += mass * w
+            end
         end
     end
+ 
+    # --- Orbit-sampled potential (from the sampled radial mass profile) --- #
+    tab_m_r = vec(sum(tab_m_r_threads, dims = 2))       # total mass per radial bin
+    r_psi   = [exp(logr_lo + (k + 0.5) * dlogr_psi) for k in 0:psi_nbins-1]
+
+    psi_tab_os, psi_tot_os, M_tab_os = find_psi_arrays(r_psi, tab_m_r)
+    psi_calc_os = psi_exact(r_psi, psi_tab_os, M_tab_os)
+
+    ORBIT_PSI[] = (r = r_psi, psi_tab = psi_tab_os, psi_tot = psi_tot_os,
+                   M_tab = M_tab_os, psi_calc = psi_calc_os)
+
+    println("Orbit-sampled potential: sampled mass = $(sum(tab_m_r)), " *
+            "snapshot mass = $(sum(dat.m)), $psi_nbins log-r bins " *
+            "over [$(r_lo_psi), $(r_hi_psi)].")
 
     ## KDE Smoothing ##
     sigma_r, sigma_v = 2.0, 2.0 # Kernel width (# bins)
@@ -504,7 +547,7 @@ function orbit_sampled_kde_rv_df(
     kernel = [exp(-0.5 * ((dr/sigma_r)^2 + (dv/sigma_v)^2))
               for dr in dr_offsets, dv in dv_offsets]
     kernel ./= sum(kernel)
-
+    
     # Convolve DF with kernel 
     tabn_kde = conv2d(tabn_rv, kernel)
     tabf_kde = conv2d(tabf_rv, kernel)
@@ -514,6 +557,87 @@ function orbit_sampled_kde_rv_df(
     sq_mass_dens = (r,v) -> bilinear_interp(r, v, logr_samp, logv_samp, tabf_kde)
 
     return SampDF(logr_samp, logv_samp, tabn_kde, tabf_kde, mass_dens, sq_mass_dens)
+end
+
+
+## Save old (discrete) and new (orbit-sampled) potentials on the psi grid ##
+function save_psi_grids(old_path::String, new_path::String)
+
+    op = ORBIT_PSI[]
+    if op === nothing
+        error("save_psi_grids: orbit-sampled psi not available; run orbit_sampled_kde_rv_df first.")
+    end
+
+    r_grid = op.r
+    N = length(r_grid)
+
+    # Old potential on its own exact (per-particle) grid.
+    h5open(old_path, "w") do f
+        f["r"]   = collect(dat.r)
+        f["psi"] = collect(psi_tot_tab)
+    end
+
+    # New (orbit-sampled) potential on its log-r grid.
+    h5open(new_path, "w") do f
+        f["r"]          = collect(r_grid)
+        f["psi"]        = collect(op.psi_tot)
+        f["M_enclosed"] = collect(op.M_tab[1:N])
+    end
+
+    return nothing
+end
+
+
+## Switch the active potential to the orbit-sampled one. Updates the globals ##
+## (psi_rtab, psi_tab, psi_tot_tab, M_tab, psi_calc, psi_Mtot) that find_Lc,   ##
+## find_rp_ra, psi_orbit and psi_eff read.                                     ##
+function activate_orbit_psi!()
+
+    op = ORBIT_PSI[]
+    if op === nothing
+        error("activate_orbit_psi!: orbit-sampled psi not available; run orbit_sampled_kde_rv_df first.")
+    end
+
+    global psi_rtab    = op.r
+    global psi_tab     = op.psi_tab
+    global psi_tot_tab = op.psi_tot
+    global M_tab       = op.M_tab
+    global psi_calc    = op.psi_calc
+    global psi_Mtot    = op.M_tab[end-1]   # total stellar mass (M_arr[N] = sum of shells)
+
+    println("Activated orbit-sampled potential: $(length(op.r)) grid points, " *
+            "psi_Mtot = $psi_Mtot.")
+    return nothing
+end
+
+
+## Save the orbit-sampled potential arrays to HDF5 (for reuse in later runs) ##
+function save_orbit_psi(name::String)
+    op = ORBIT_PSI[]
+    if op === nothing
+        error("save_orbit_psi: orbit-sampled psi not available; run orbit_sampled_kde_rv_df first.")
+    end
+    h5open(name, "w") do f
+        f["r"]       = collect(op.r)
+        f["psi_tab"] = collect(op.psi_tab)
+        f["psi_tot"] = collect(op.psi_tot)
+        f["M_tab"]   = collect(op.M_tab)
+    end
+    println("Saved orbit-sampled potential to $name ($(length(op.r)) grid points).")
+    return nothing
+end
+
+
+## Load an orbit-sampled potential from HDF5 into ORBIT_PSI (then call activate_orbit_psi!) ##
+function load_orbit_psi!(name::String)
+    r, psi_tab_os, psi_tot_os, M_tab_os = h5open(name, "r") do f
+        (read(f["r"]), read(f["psi_tab"]), read(f["psi_tot"]), read(f["M_tab"]))
+    end
+    psi_calc_os = psi_exact(r, psi_tab_os, M_tab_os)
+    ORBIT_PSI[] = (r = r, psi_tab = psi_tab_os, psi_tot = psi_tot_os,
+                   M_tab = M_tab_os, psi_calc = psi_calc_os)
+    println("Loaded orbit-sampled potential from $name ($(length(r)) grid points).")
+    return nothing
 end
 
 
