@@ -99,7 +99,7 @@ function run_mc_gw(E0, j0; max_step=100, max_t=Inf)
         end
     end
 
-    return 0.07453.* t_stor[1:n], E_stor[1:n], j_stor[1:n], a_stor[1:n], e_stor[1:n]
+    return t_conv .* t_stor[1:n], E_stor[1:n], j_stor[1:n], a_stor[1:n], e_stor[1:n]
 end
 
 function loss_cone(E)

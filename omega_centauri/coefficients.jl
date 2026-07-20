@@ -423,7 +423,7 @@ function generate_coeffs(res)
     #emin, emax = extrema(EE[(EE .< 0) .& (dat.startype .== 14)])
     emin, emax = extrema(EE[(EE .< 0) .& (dat.startype .> -100)])
 
-    j_min = 1e-3
+    j_min = 1e-6
     j_max = 0.999
     
     j_edges = 10 .^ range(log10(j_min), log10(j_max), length=res + 1)
@@ -431,7 +431,7 @@ function generate_coeffs(res)
     # Geometric centers of the log bins
     j_tab = sqrt.(j_edges[1:end-1] .* j_edges[2:end])
     
-    E_abs_edges = 10 .^ range(log10(0.1), log10(abs(emin)), length=res + 1)
+    E_abs_edges = 10 .^ range(log10(abs(emax)), log10(abs(emin)), length=res + 1)
     
     E_edges = reverse(-E_abs_edges)
     E_tab = reverse(-sqrt.(E_abs_edges[1:end-1] .* E_abs_edges[2:end]))
@@ -440,7 +440,7 @@ function generate_coeffs(res)
          DEE_tab, Djj_tab, DEj_tab) = coef_grid(E_tab,j_tab,res)
 
     # Bilinear interpolation
-    interp(Z) = (j,E) -> bilinear_interp(j, E, j_tab, E_tab, Z)
+    interp(Z) = (j,E) -> bilinear_interp_clamped(j, E, j_tab, E_tab, Z)
     
     return DiffusionCoeffs(
         DE1_tab, DE2_tab, Dj1_tab, Dj2_tab,
@@ -486,7 +486,7 @@ function load_coeffs(name::String)
         DEj_tab = read(file["DEj_tab"])
 
         # Bilinear interpolation
-        interp(Z) = (j,E) -> bilinear_interp(j, E, j_tab, E_tab, Z)
+        interp(Z) = (j,E) -> bilinear_interp_clamped(j, E, j_tab, E_tab, Z)
 
         return DiffusionCoeffs(
             DE1_tab, DE2_tab, Dj1_tab, Dj2_tab,

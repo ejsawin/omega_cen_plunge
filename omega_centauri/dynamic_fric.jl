@@ -81,7 +81,7 @@ function plunge(ri, rf, Mbh, rad; dt=0.1)
     end
 
     # Convert to Myr, pc
-    return t_tab .* 0.07453, r_tab .* 5
+    return t_tab .* t_conv, r_tab .* r_conv
 end
 
 ## Plot plunge in 2D ##
@@ -94,8 +94,8 @@ function plot_plunge(ri, rf, Mbh, rad; dt=0.1, filename="plunge.png")
 
     for i in 2:n
         
-        r_henon = r_pc[i] / 5.0 # Convert into physical units 
-        dt_henon = (t_myr[i] - t_myr[i-1]) / 0.07453
+        r_henon = r_pc[i] / r_conv # Convert pc -> code units
+        dt_henon = (t_myr[i] - t_myr[i-1]) / t_conv
 
         θ[i] = θ[i-1] + (vc(r_henon) / r_henon) * dt_henon # Assuming circular velocity, same as code
     end

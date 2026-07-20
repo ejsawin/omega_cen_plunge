@@ -21,12 +21,14 @@ end
 ## GW emission rates (E, L) ##
 function gw_rates(aa,ee,m_obj)
 
-    de1 = -32 * (G^4) * (M_bh^2) * (m_obj^2) * (M_bh + m_obj) # Eq 5.4 Peters 1964 
+    # Specific rates (per unit m_obj): Peters total rates carry m_obj^2; the MC's
+    # E, L are per unit mass, so one power of m_obj is divided out here.
+    de1 = -32 * (G^4) * (M_bh^2) * m_obj * (M_bh + m_obj) # Eq 5.4 Peters 1964
     de2 = 5 * (c^5) * (aa^5) * (1 - (ee^2))^(7/2)
     de3 = 1 + (73/24) * (ee^2) + (37/96) * (ee^4)
     dE_dt = (de1 / de2) * de3
 
-    dl1 = -32 * (G^(7/2)) * (M_bh^2) * (m_obj^2) * (M_bh + m_obj)^(1/2) # Eq 5.5 Peters 1964
+    dl1 = -32 * (G^(7/2)) * (M_bh^2) * m_obj * (M_bh + m_obj)^(1/2) # Eq 5.5 Peters 1964
     dl2 = 5 * (c^5) * (aa^(7/2)) * (1-(ee^2))^2
     dl3 = 1 + (7/8)*(ee^2)
     dL_dt = (dl1/dl2) * dl3
@@ -61,7 +63,7 @@ function gw_timescale(E,j)
     int_calc, err_calc= quadgk(x -> tint(x), 0, e, rtol=1e-8)
     
     # Return t_GW in Myr
-    return 0.07453 * int_calc
+    return t_conv * int_calc
 end
 
 ## Peter GW Timescale Approximations ## 
@@ -87,5 +89,5 @@ function peter_approx(E,j)
     small = (c0^4)/(4*beta)*e^(48/19) # e ~ 0
     large = (768/425)*Tc*(1-e^2)^(7/2) # e ~ 1
 
-    return 0.07453 .* (Tc, small, large) # Convert to Myrs
+    return t_conv .* (Tc, small, large) # Convert to Myrs
 end

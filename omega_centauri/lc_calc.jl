@@ -131,12 +131,16 @@ function find_Lc(E)
 end
 
 ## Finite difference derivatives for (E,L) -> (E,j) ##
+# Relative step: an absolute one is noise-dominated for deeply bound E and can
+# push E across 0 (unbound) for weakly bound E.
 function dLc_dE(E)
-    return (find_Lc(E+epsilon)[2]-find_Lc(E-epsilon)[2])/(2*epsilon)
+    eps_E = 1e-4 * abs(E)
+    return (find_Lc(E+eps_E)[2]-find_Lc(E-eps_E)[2])/(2*eps_E)
 end
 
 function d2Lc_dE2(E)
-    return (find_Lc(E+epsilon)[2]+find_Lc(E-epsilon)[2]-2*find_Lc(E)[2])/(epsilon^2)
+    eps_E = 1e-4 * abs(E)
+    return (find_Lc(E+eps_E)[2]+find_Lc(E-eps_E)[2]-2*find_Lc(E)[2])/(eps_E^2)
 end
 
 

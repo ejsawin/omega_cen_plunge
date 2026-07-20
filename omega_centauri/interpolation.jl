@@ -37,6 +37,40 @@ function bilinear_interp(x, y, x_grid, y_grid, f_grid)
     end
 end
 
+## Bilinear interpolation with nearest-edge extrapolation ##
+# Out-of-bounds queries are clamped to the grid, so they take the closest edge value
+# instead of 0. Used for the (E,j) diffusion-coefficient samplers in mc_step; the DF
+# samplers keep the zero-outside bilinear_interp. Assumes ascending grids.
+function bilinear_interp_clamped(x, y, x_grid, y_grid, f_grid)
+    nx = length(x_grid)
+    ny = length(y_grid)
+
+    # Clamp the query into the grid (nearest-edge extrapolation)
+    xc = clamp(x, x_grid[1], x_grid[end])
+    yc = clamp(y, y_grid[1], y_grid[end])
+
+    # Bracket indices, clamped to a valid interior cell so the exact upper edge works
+    ix = clamp(searchsortedlast(x_grid, xc), 1, nx - 1)
+    iy = clamp(searchsortedlast(y_grid, yc), 1, ny - 1)
+
+    @inbounds begin
+        x1, x2 = x_grid[ix], x_grid[ix + 1]
+        y1, y2 = y_grid[iy], y_grid[iy + 1]
+
+        f11 = f_grid[ix, iy]
+        f12 = f_grid[ix, iy + 1]
+        f21 = f_grid[ix + 1, iy]
+        f22 = f_grid[ix + 1, iy + 1]
+
+        denom = (x2 - x1) * (y2 - y1)
+
+        return ((x2 - xc) * (y2 - yc) * f11 +
+                (x2 - xc) * (yc - y1) * f12 +
+                (xc - x1) * (y2 - yc) * f21 +
+                (xc - x1) * (yc - y1) * f22) / denom
+    end
+end
+
 ## 1D midpoint integration ##
 function midpoint(func,x_start,x_end,steps)
 

@@ -11,7 +11,7 @@ function mc_step(E,j,coef,m_obj)
     if orbit_failed(rp, ra)
         # Return whatever your code uses to mark a terminated/rejected orbit.
         # Do not calculate a, e, period, or GW rates.
-        return -100.0, -100.0, 1000
+        return -100.0, -100.0, 1000, 1000, false
     end
     
     a = (rp + ra) / 2
@@ -19,13 +19,13 @@ function mc_step(E,j,coef,m_obj)
     
     # Extra protection against bad elements.
     if !isfinite(a) || !isfinite(e) || a <= 0 || e < 0 || e >= 1
-        return -100.0, -100.0, 1000
+        return -100.0, -100.0, 1000, 1000, false
     end
     
     period = find_period(E, L)
     
     if !isfinite(period) || period <= 0
-        return -100.0, -100.0, 1000
+        return -100.0, -100.0, 1000, 1000, false
     end
     
     period = find_period(E,L)
@@ -48,20 +48,35 @@ function mc_step(E,j,coef,m_obj)
     dj_tot = dj_NR + dj_GW
 
     # Step Size
-    MCResolution = 10000   # resolution knob: step is 1/MCResolution of the diffusion timescale
-    F_safe = 1            # physics floor: timestep must exceed F_safe orbital periods
+    F_safe = 10 # step covers N = max(1, N_safe) orbits (paper default; tested 3-30)
 
-    gw_term = E / dE_GW
-#    nr_term = sqrt((j^2) / (djj_NR * period))
-    nr_term = sqrt((j^2) / (djj_NR))
+    # Paper's two timescales: GW on E, and L-diffusion (in j here). t_jj is clamped
+    # >= 0 so noisy interpolation can't give a negative timescale (-> Inf = unconstrained).
+    t_gwE = abs(E / dE_GW)           # GW on E
+    t_jj  = j^2 / max(djj_NR, 0.0)   # L-diffusion (in j)
 
+    # Two regimes. When the GW timescale drops below one orbit (t_gwE < period),
+    # dE_GW*period > |E|: the orbit-averaged Peters rate is past its validity, because
+    # GW is really a discrete kick delivered once per orbit at pericenter, not a smooth
+    # drift. There we step on the diffusion-limited dt (GW excluded) and deliver the
+    # full per-orbit GW burst only when the walker actually reaches pericenter this
+    # step (probability check_lc = dt/period); the driver tests the loss cone on that
+    # same event. Otherwise (GW slow, many orbits) integrate GW continuously.
+    #
+    # Paper: N_safe = (1/F_safe) min(E/dE_GW, sqrt(L^2/(<dL^2>_o P))). The linear GW
+    # term is dropped in the plunge regime, where GW is delivered as a per-pericenter
+    # burst rather than limiting the step.
+    plunge = t_gwE < period
 
-
-    N_safe = (1/MCResolution) * min(gw_term, nr_term) # Choose smaller timestep
-#    println("GW: $gw_term, NR: $nr_term")
-#    N_orb = max(1.0, N_safe)
-#    dt = N_orb * period
-    dt = max(N_safe, F_safe * period)
+    if plunge
+        N_safe = (1/F_safe) * sqrt(t_jj / period)
+        # Cap at one orbit: off-grid (djj = 0) gives N_safe = Inf, and dt/period must
+        # stay <= 1 to be a valid pericenter-reach probability.
+        dt = min(N_safe, 1.0) * period
+    else
+        N_safe = (1/F_safe) * min(t_gwE / period, sqrt(t_jj / period))
+        dt = N_safe * period
+    end
 
     denom = sqrt(abs(dEE_NR * djj_NR))
 
@@ -84,23 +99,59 @@ function mc_step(E,j,coef,m_obj)
     #E_step = E + dE
     #j_step = j + dj
 
-    dE_new = dE_NR * dt + g1t * sqrt(dEE_NR * dt)
-    dj_new = dj_NR * dt + g2t * sqrt(djj_NR * dt)
-    
+    dE_new = dE_NR * dt + g1t * sqrt(max(dEE_NR, 0.0) * dt)
+    dj_new = dj_NR * dt + g2t * sqrt(max(djj_NR, 0.0) * dt)
+
     E_new = E + dE_new
     j_new = j + dj_new
-    
+
+    # Diffused out of the bound region -> escaped. Return now (captured = false): for
+    # E >= 0, find_Lc gives Lc -> 0 and j = L/Lc -> +-Inf, which must NOT be read as a
+    # loss-cone capture. The driver logs this as escaped/unbound.
+    if E_new >= 0.0
+        return E_new, j_new, dt, period, false
+    end
+
     rc_new, Lc_new = find_Lc(E_new)
     L_new = j_new * Lc_new
-    
-    E_step = E_new + dE_GW * dt
-    L_step = L_new + dL_GW * dt
-    
+
+    # Reached pericenter this step? Once per orbit on average.
+    check_lc = rand() < dt / period
+
+    if plunge
+        if check_lc
+            # Pre-burst loss-cone test: capture is decided on the APPROACHING orbit
+            # (post-diffusion, pre-GW), so it's recorded at entry rather than at the
+            # deep post-burst E.
+            if reflect_j(j_new) <= loss_cone(E_new)
+                return E_new, reflect_j(j_new), dt, period, true
+            end
+            # Not captured: radiate one full orbit's GW as it passes pericenter
+            # (E[burst] = (dt/P)*(dE_GW*P) = dE_GW*dt, the right mean).
+            E_step = E_new + dE_GW * period
+            L_step = L_new + dL_GW * period
+        else
+            # Coasting far from pericenter: no GW, no loss-cone test.
+            E_step = E_new
+            L_step = L_new
+        end
+    else
+        # GW is a slow perturbation: integrate continuously.
+        E_step = E_new + dE_GW * dt
+        L_step = L_new + dL_GW * dt
+    end
+
     rc_step, Lc_step = find_Lc(E_step)
     j_step = L_step / Lc_step
-    
-    return E_step, j_step, dt
-    
+
+    # Normal-regime loss cone: once per orbit on the current state (continuous GW is a
+    # small perturbation here, so pre/post are equivalent).
+    if !plunge && check_lc && reflect_j(j_step) <= loss_cone(E_step)
+        return E_step, j_step, dt, period, true
+    end
+
+    return E_step, j_step, dt, period, false
+
 end
 
 ## Reflecting boundary: single reflection at j = 0 and j = 1 (for j in [-1, 2]) ##
@@ -144,6 +195,7 @@ function run_mc(E0, j0, coef, m_obj; max_step=100, max_t=Inf)
         # walker; the batch continues with the next black hole.
         if !isfinite(j) || j < -1.0 || j > 2.0
             println(stderr, "WARNING: pathological j = $j (E = $E) at step $step; ending walker early.")
+            flush(stderr)
             break
         end
 
@@ -155,7 +207,7 @@ function run_mc(E0, j0, coef, m_obj; max_step=100, max_t=Inf)
         println("E = $E, j = $j, t = $t")
     end
 
-    return 0.07453 .* t_stor[1:n], E_stor[1:n], j_stor[1:n]
+    return t_conv .* t_stor[1:n], E_stor[1:n], j_stor[1:n]
 end
 
 
@@ -175,60 +227,96 @@ function run_mc_rp_ra(E0, j0, coef, m_obj; max_step=100, max_t=Inf)
     
     E_stor[1], j_stor[1], t_stor[1] = E0, j0, 0.0
 
-    # Initial values 
+    # Initial values
     E, j, t = E0, j0, 0.0
     n = 1
     reason = 3   # default: reached max_step
 
+    # Initial-condition loss-cone check (a walker could start inside).
+    j_lc0 = loss_cone(E)
+    if j <= j_lc0
+        reason = 1
+        println("Entered loss cone (j = $j, j_lc = $j_lc0)")
+        return t_conv .* t_stor[1:n], E_stor[1:n], j_stor[1:n],
+               rp_stor[1:n], ra_stor[1:n], reason
+    end
+
     for step in 1:max_step
-        j_lc = loss_cone(E)
 
         if E <= -10000000
             reason = -100
-            println("Below potential minimum: (E = $E)")
-            break
-        elseif j <= j_lc
-            reason = 1
-            println("Entered loss cone (j = $j, j_lc = $j_lc)")
+            println(stderr, "REASON -100: below potential minimum (E = $E) at step $step; ending walker early.")
+            flush(stderr)
             break
         elseif E >= 0.0
             reason = -100
+            println(stderr, "REASON -100: escaped/unbound at loop top (E = $E) at step $step; ending walker early.")
+            flush(stderr)
             break
         elseif t >= max_t
             reason = 2
             break
         end
 
-        E, j, dt = mc_step(E,j,coef,m_obj)
+        E_new, j_new, dt, P_orb, captured = mc_step(E,j,coef,m_obj)
 
-        # Diffused out of the bound region (E >= 0) -> object escaped; end
-        # walker. find_Lc for E >= 0 would otherwise give j = L/Lc = -Inf.
-        if E >= 0.0
+        # mc_step could not characterize the orbit (find_rp_ra / find_period failed);
+        # it returns the sentinel (-100, -100, 1000). Report the real (E, j).
+        if E_new == -100.0 && j_new == -100.0
             reason = -100
+            println(stderr, "REASON -100: orbit uncharacterizable at step $step (E = $E, j = $j); ending walker early.")
+            flush(stderr)
             break
         end
 
-        # Pathological step (Inf/NaN or j far outside [0, 1]) -> end this
-        # walker; the batch continues with the next black hole.
-        if !isfinite(j) || j < -1.0 || j > 2.0
-            reason = -100
-            println(stderr, "WARNING: pathological j = $j (E = $E) at step $step; ending walker early.")
+        # Captured: mc_step tested the loss cone at pericenter (pre-burst).
+        if captured
+            reason = 1
+            println("Entered loss cone (j = $j_new, E = $E_new) at step $step")
             break
         end
 
-        j = reflect_j(j) # Reflecting boundary at j = 0 and j = 1
+        # Pathological step (Inf/NaN or j far outside [0, 1]) -> end this walker.
+        if !isfinite(j_new) || j_new < -1.0 || j_new > 2.0
+            reason = -100
+            println(stderr, "REASON -100: pathological j = $j_new (E = $E_new) at step $step; ending walker early.")
+            flush(stderr)
+            break
+        end
+
+        # Completing this step would pass max_t: discard it and time out.
+        if t + dt > max_t
+            reason = 2
+            break
+        end
+
+        # Diffused out of the bound region (E >= 0) -> object escaped.
+        if E_new >= 0.0
+            reason = -100
+            println(stderr, "REASON -100: escaped/unbound after step (E = $E_new) at step $step; ending walker early.")
+            flush(stderr)
+            break
+        end
+
+        E = E_new
+        # Adaptive j floor: below ~2e-8 the eccentricity rounds to e = 1.0 and the orbit
+        # becomes uncharacterizable, and a j well inside the loss cone is a plunge where
+        # the period is unchanged with j at fixed E. Clamp at 10% of j_lc(E) (deep inside
+        # the cone, but adapts to E instead of a fixed 1e-6); never below 1e-7 so the
+        # orbit stays characterizable. The loss-cone capture is decided in mc_step.
+        j = max(reflect_j(j_new), 0.1 * loss_cone(E_new), 1.0e-7)
         t += dt
         n += 1
 
         E_stor[n], j_stor[n], t_stor[n] = E, j, t
         rc, Lc = find_Lc(E)
-        
+
         rp, ra = find_rp_ra(E, j*Lc)
         rp_stor[n], ra_stor[n] = rp, ra
         #println("E = $E, j = $j, t = $t, rp = $rp, ra = $ra")
     end
 
-    return 0.07453 .* t_stor[1:n], E_stor[1:n], j_stor[1:n], rp_stor[1:n], ra_stor[1:n], reason
+    return t_conv .* t_stor[1:n], E_stor[1:n], j_stor[1:n], rp_stor[1:n], ra_stor[1:n], reason
 end
 
 
@@ -236,6 +324,15 @@ end
 function loss_cone(E)
     J_icbo = (4 * G * M_bh) / c
     Jc = last(find_Lc(E))
+
+    # Degenerate circular angular momentum -> loss cone undefined here. Returning
+    # NaN makes j <= j_lc false, so the walker fails loudly (-100) downstream
+    # instead of being recorded as a spurious capture via j_lc = Inf.
+    if !isfinite(Jc) || Jc <= 0.0
+        println(stderr, "WARNING: find_Lc gave Jc = $Jc at E = $E; loss cone undefined here.")
+        return NaN
+    end
+
     return J_icbo / Jc
 end
 
@@ -263,8 +360,8 @@ function ej_from_phase(r, vr, vt)
 end
 
 
-## Initial (E, j, mass) for every bound black hole (startype == 14) in a snapshot ##
-function black_hole_ics(dat; startype = 14)
+## Initial (E, j, mass) for every bound compact objectin a snapshot ##
+function black_hole_ics(dat; startypes = (14))
 
     inds = Int[]
     E0s  = Float64[]
@@ -272,7 +369,7 @@ function black_hole_ics(dat; startype = 14)
     m0s  = Float64[]
 
     for i in eachindex(dat.startype)
-        dat.startype[i] == startype || continue     # target type only
+        dat.startype[i] in startypes || continue    # target types only
 
         E, L, j = ej_from_phase(dat.r[i], dat.vr[i], dat.vt[i])
         isfinite(j) || continue                      # skip unbound
