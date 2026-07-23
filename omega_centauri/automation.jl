@@ -16,6 +16,44 @@ function _snapshot_time(key::AbstractString)
     return parse(Float64, m.captures[1])
 end
 
+## IMBH mass (code units) at a given time from a CMC centmass.dat file ##
+#
+# The file has a header line "#1:t #2:cenma.m #3:Dt ..." then whitespace-separated rows,
+# with the MBH mass in column `cenma.m` and time in column `t`, both in CODE units.
+# `target_time_myr` is in Myr; `myr_per_code` is the Myr per code time unit (e.g. t_conv),
+# used to convert it to code time before interpolating cenma.m linearly (nearest-edge
+# outside the recorded range).
+function get_MBH_mass(centmass_path::AbstractString, target_time_myr::Real, myr_per_code::Real)
+
+    centmass_path = expanduser(centmass_path)
+
+    t_idx = 0; m_idx = 0
+    times = Float64[]; masses = Float64[]
+
+    for line in eachline(centmass_path)
+        s = strip(line)
+        isempty(s) && continue
+        if startswith(s, "#")
+            if occursin(r"#\d+:", s)
+                names = [String(mm.captures[1]) for mm in eachmatch(r"#\d+:(\S+)", s)]
+                ti = findfirst(==("t"), names);        t_idx = ti === nothing ? 0 : ti
+                mi = findfirst(==("cenma.m"), names);  m_idx = mi === nothing ? 0 : mi
+            end
+            continue
+        end
+        (t_idx == 0 || m_idx == 0) &&
+            error("get_MBH_mass: 't'/'cenma.m' columns not found before data in $centmass_path")
+        f = split(s)
+        push!(times,  parse(Float64, f[t_idx]))
+        push!(masses, parse(Float64, f[m_idx]))
+    end
+
+    isempty(times) && error("get_MBH_mass: no numeric rows in $centmass_path")
+
+    target_code = target_time_myr / myr_per_code   # Myr -> code time
+    return _interp1(target_code, times, masses)     # linear interp, nearest at the ends
+end
+
 ## Process every snapshot spaced ~`sep` Gyr apart: build the orbit-sampled potential
 ## and diffusion coefficients for each, saving into `out_folder`:
 ##   <prefix>_<time>Gyr.h5          -- diffusion coefficients (grid_size x grid_size)
@@ -26,10 +64,10 @@ end
 ## `time` is formatted with 2 decimals and a "dot" (e.g. 1.00 Gyr -> "IMBH01_1dot00Gyr").
 ## Reassigns the same globals main.jl uses; run it fresh (e.g. via run_automated_dc.jl).
 function automate_dc(filename::AbstractString, sep::Real, out_folder::AbstractString,
-                     name_prefix::AbstractString; n_rv::Integer = 1000,
-                     grid_size::Integer = 200)
+                     name_prefix::AbstractString; centmass_path::AbstractString,
+                     myr_per_code::Real, n_rv::Integer = 1000, grid_size::Integer = 200)
 
-    global dat, psi_tab, psi_tot_tab, M_tab, psi_rtab, psi_Mtot, psi_calc, ETab, DF
+    global M_bh, dat, psi_tab, psi_tot_tab, M_tab, psi_rtab, psi_Mtot, psi_calc, ETab, DF
 
     filename = expanduser(filename)
     isdir(out_folder) || mkpath(out_folder)
@@ -51,6 +89,11 @@ function automate_dc(filename::AbstractString, sep::Real, out_folder::AbstractSt
             flush(stdout)
 
             try
+                # Update the IMBH mass for this snapshot time (potential + coeffs use M_bh)
+                M_bh = get_MBH_mass(centmass_path, t_gyr * 1000.0, myr_per_code)
+                println("    M_bh = $M_bh (code units)")
+                flush(stdout)
+
                 # Snapshot + its (Henon) potential
                 dat = read_file_h5(filename, key)
                 psi_tab, psi_tot_tab, M_tab = find_psi_arrays(dat.r, dat.m)
@@ -59,12 +102,13 @@ function automate_dc(filename::AbstractString, sep::Real, out_folder::AbstractSt
                 psi_calc = psi_exact(psi_rtab, psi_tab, M_tab)
                 ETab = sort(0.5 .* (dat.vr .^ 2 .+ dat.vt .^ 2) .+ psi_calc.(dat.r))
 
-                # Record the lowest-101 particle energies (snapshot potential) + time
+                # Record the lowest-101 particle energies (snapshot potential) + time + M_bh
                 nlow = min(101, length(ETab))
                 g = create_group(pf, "$(tag)Gyr")
                 g["ETab_low101"] = ETab[1:nlow]
                 attrs(g)["time"] = t_gyr
                 attrs(g)["key"]  = String(key)
+                attrs(g)["M_bh"] = M_bh
                 flush(pf)
 
                 # Orbit-sampled DF + potential, then switch the active potential to it
@@ -241,8 +285,11 @@ end
 # max_t is in Myr (run_mc_rp_ra now converts to code units internally).
 function automate_mc(snapshot_file::AbstractString, dc_folder::AbstractString, sep::Real,
                      name_prefix::AbstractString, max_t::Real, max_steps::Integer;
+                     centmass_path::AbstractString, myr_per_code::Real,
                      method::Integer = 2, level_low::Integer = 2, level_high::Integer = 11,
                      E_end::Real = -1.5e6, n_E_total::Integer = 300, smooth_sigma::Real = 2.0)
+
+    global M_bh
 
     snapshot_file = expanduser(snapshot_file)
     dc_folder     = expanduser(dc_folder)
@@ -266,8 +313,7 @@ function automate_mc(snapshot_file::AbstractString, dc_folder::AbstractString, s
         attrs(of)["level_high"] = level_high
         attrs(of)["E_end"]      = float(E_end)
         attrs(of)["n_E_total"]  = n_E_total
-        attrs(of)["M_bh"]       = M_bh
-        attrs(of)["nthreads"]   = Threads.nthreads()
+        attrs(of)["nthreads"]   = Threads.nthreads()  # M_bh is per-snapshot (see each group)
 
         for (i, key) in enumerate(snap_keys)
             t_gyr = _snapshot_time(key)
@@ -285,6 +331,12 @@ function automate_mc(snapshot_file::AbstractString, dc_folder::AbstractString, s
             end
 
             try
+                # IMBH mass for this snapshot time -- must match what automate_dc used, and
+                # feeds loss_cone / gw_rates / find_Lc and the psi IMBH term below.
+                M_bh = get_MBH_mass(centmass_path, t_gyr * 1000.0, myr_per_code)
+                println("    M_bh = $M_bh (code units)")
+                flush(stdout)
+
                 # Match the potential + coefficients this snapshot was built with.
                 coef = load_coeffs(coef_file)
                 load_orbit_psi!(psi_file)
@@ -318,6 +370,7 @@ function automate_mc(snapshot_file::AbstractString, dc_folder::AbstractString, s
 
                 g = create_group(of, "$(tag)Gyr")
                 attrs(g)["time"] = t_gyr
+                attrs(g)["M_bh"] = M_bh
                 attrs(g)["N"]    = N
                 g["indices"] = ics.indices
                 g["E0s"] = ics.E0;  g["J0s"] = ics.J0;  g["m0s"] = ics.m0
