@@ -94,3 +94,59 @@ function read_file_h5(filename::String, dataset::Union{Nothing, String} = nothin
         r_tab, m_tab, vr_tab, vt_tab, v_tab,
         N, rmin, rmax, vmin, vmax, vrmin, vrmax, vtmin, vtmax)
 end
+
+## Snapshot keys spaced ~`sep` Gyr apart, in time order ##
+#
+# Keys look like "<index>(t=<time>Gyr)"; the index prefix is NOT time-ordered, so the
+# time is parsed out and used for sorting. Starting from `sep`, the first snapshot at or
+# after each target (sep, 2*sep, ...) is selected, giving snapshots spaced >= `sep` Gyr.
+# Returns the selected keys as Strings in increasing time order. `sep` defaults to
+# 0.1 Gyr (100 Myr). Feed each returned key to read_file_h5(filename, key).
+function snapshot_keys_by_time(filename::String; sep::Real = 0.1)
+
+    filename = expanduser(filename)
+
+    all_keys = h5open(filename, "r") do f
+        collect(keys(f))
+    end
+
+    # Parse the time (Gyr) out of each key; skip non-matching keys and the t = 0
+    # snapshot (always excluded).
+    times     = Float64[]
+    keys_kept = String[]
+    for key in all_keys
+        m = match(r"t=([-+0-9.eE]+)\s*Gyr", key)
+        m === nothing && continue
+        t = parse(Float64, m.captures[1])
+        t > 0 || continue
+        push!(times, t)
+        push!(keys_kept, key)
+    end
+
+    isempty(times) && return String[]
+
+    # Sort by time (the numeric index prefix is unordered).
+    ord       = sortperm(times)
+    times     = times[ord]
+    keys_kept = keys_kept[ord]
+
+    # Fixed thresholds k*sep (k = 1, 2, ...): select the first snapshot at/after each,
+    # deduplicating when snapshots are sparser than `sep`. Fixed thresholds (rather than
+    # chaining off the last picked time) keep every ~sep-spaced snapshot even when the
+    # times jitter around round values, e.g. 0.10007, 0.20002, 0.40001.
+    tol      = 1e-6 * sep
+    selected = String[]
+    tmax     = times[end]
+    last_idx = 0
+    k        = 1
+    while k * sep <= tmax + tol
+        idx = searchsortedfirst(times, k * sep - tol)   # first time >= k*sep
+        if idx <= length(times) && idx != last_idx
+            push!(selected, keys_kept[idx])
+            last_idx = idx
+        end
+        k += 1
+    end
+
+    return selected
+end

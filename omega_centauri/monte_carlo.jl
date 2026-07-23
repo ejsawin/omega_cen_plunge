@@ -168,6 +168,9 @@ end
 
 function run_mc(E0, j0, coef, m_obj; max_step=100, max_t=Inf)
 
+    # max_t is in Myr; the internal clock t is in code (Henon) units, so convert once.
+    max_t_code = max_t / t_conv
+
     # Initialize storage arrays
     E_stor = Vector{Float64}(undef, max_step + 1)
     j_stor = Vector{Float64}(undef, max_step + 1)
@@ -175,7 +178,7 @@ function run_mc(E0, j0, coef, m_obj; max_step=100, max_t=Inf)
 
     E_stor[1], j_stor[1], t_stor[1] = E0, j0, 0.0
 
-    # Initial values 
+    # Initial values
     E, j, t = E0, j0, 0.0
     n = 1
 
@@ -185,7 +188,7 @@ function run_mc(E0, j0, coef, m_obj; max_step=100, max_t=Inf)
         if j <= j_lc
             println("Entered loss cone (j = $j, j_lc = $j_lc)")
             break
-        elseif E >= 0.0 || t >= max_t
+        elseif E >= 0.0 || t >= max_t_code
             break
         end
 
@@ -204,7 +207,7 @@ function run_mc(E0, j0, coef, m_obj; max_step=100, max_t=Inf)
         n += 1
 
         E_stor[n], j_stor[n], t_stor[n] = E, j, t
-        println("E = $E, j = $j, t = $t")
+        println("E = $E, j = $j, t = $(t_conv * t)")
     end
 
     return t_conv .* t_stor[1:n], E_stor[1:n], j_stor[1:n]
@@ -212,6 +215,9 @@ end
 
 
 function run_mc_rp_ra(E0, j0, coef, m_obj; max_step=100, max_t=Inf)
+
+    # max_t is in Myr; the internal clock t is in code (Henon) units, so convert once.
+    max_t_code = max_t / t_conv
 
     # Initialize storage arrays
     E_stor = Vector{Float64}(undef, max_step + 1)
@@ -253,7 +259,7 @@ function run_mc_rp_ra(E0, j0, coef, m_obj; max_step=100, max_t=Inf)
             println(stderr, "REASON -100: escaped/unbound at loop top (E = $E) at step $step; ending walker early.")
             flush(stderr)
             break
-        elseif t >= max_t
+        elseif t >= max_t_code
             reason = 2
             break
         end
@@ -285,7 +291,7 @@ function run_mc_rp_ra(E0, j0, coef, m_obj; max_step=100, max_t=Inf)
         end
 
         # Completing this step would pass max_t: discard it and time out.
-        if t + dt > max_t
+        if t + dt > max_t_code
             reason = 2
             break
         end
