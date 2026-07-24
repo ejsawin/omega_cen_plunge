@@ -48,10 +48,19 @@ function read_file(filename::String)
         N, rmin, rmax, vmin, vmax, vrmin, vrmax, vtmin, vtmax)
 end
 
-function read_file_h5(filename::String, dataset::Union{Nothing, String} = nothing)
+function read_file_h5(filename::String, dataset::Union{Nothing, String} = nothing,
+                      conv_path::Union{Nothing, AbstractString} = nothing)
 
     filename = expanduser(filename)
-    conversion = 5.52429e6
+
+    # If a .conv.sh path is given, set the model constants from it first (c, t_conv,
+    # r_conv, timeunitsmyr, massunitmsun). Each model has its own massunitmsun -- the
+    # M_sun-per-code-mass factor that converts particle masses -- so hard-coding it
+    # (was 5.52429e6, the Elena value) silently corrupts masses for any other model.
+    if conv_path !== nothing
+        set_model_constants!(conv_path)
+    end
+    conversion = massunitmsun   # M_sun per code mass unit (from the active model constants)
 
     dat = h5open(filename, "r") do f
 
@@ -93,6 +102,71 @@ function read_file_h5(filename::String, dataset::Union{Nothing, String} = nothin
         id_tab, startype_tab, binflag_tab,
         r_tab, m_tab, vr_tab, vt_tab, v_tab,
         N, rmin, rmax, vmin, vmax, vrmin, vrmax, vtmin, vtmax)
+end
+
+## Set the model-dependent constants from a CMC .conv.sh file ##
+#
+# The .conv.sh file (e.g. output.conv.sh) is a list of `key=value` bash assignments.
+# We read three of them and derive the code speed of light:
+#
+#   nbtimeunitsmyr   -> t_conv        N-body time unit [Myr]  (the MC / orbit clock)
+#   lengthunitparsec -> r_conv        code length unit [pc]
+#   timeunitsmyr     -> timeunitsmyr  code time unit [Myr]    (converts centmass.dat times)
+#
+#   c = c_phys / v_unit,   v_unit = (r_conv pc) / (t_conv Myr)   [the code velocity unit]
+#
+# G and M are always 1 and are NOT touched. M_bh is per-snapshot (from centmass.dat) and
+# is likewise not set here. Reassigns the typed globals c, t_conv, r_conv, timeunitsmyr
+# (see constants.jl) and prints ONE summary line. Call once per model import -- every
+# snapshot of a given model shares one .conv.sh. Returns the constants as a NamedTuple.
+function set_model_constants!(conv_path::AbstractString)
+
+    conv_path = expanduser(conv_path)
+
+    # Parse `key=value` lines (skip comments, blanks, and non-numeric right-hand sides
+    # such as `outprefix=output`). Exact-key match avoids `timeunitsmyr` colliding with
+    # the `nbtimeunitsmyr` / `timeunitcgs` substrings.
+    vals = Dict{String,Float64}()
+    for line in eachline(conv_path)
+        s = strip(line)
+        (isempty(s) || startswith(s, "#")) && continue
+        eq = findfirst('=', s)
+        eq === nothing && continue
+        key = strip(s[1:prevind(s, eq)])
+        rhs = strip(s[nextind(s, eq):end])
+        v = tryparse(Float64, rhs)
+        v === nothing && continue
+        vals[key] = v
+    end
+
+    for k in ("nbtimeunitsmyr", "lengthunitparsec", "timeunitsmyr",
+              "lengthunitcgs", "nbtimeunitcgs", "massunitmsun")
+        haskey(vals, k) || error("set_model_constants!: '$k' not found in $conv_path")
+    end
+
+    global t_conv       = vals["nbtimeunitsmyr"]     # N-body time unit [Myr]
+    global r_conv       = vals["lengthunitparsec"]   # code length unit [pc]
+    global timeunitsmyr = vals["timeunitsmyr"]       # code time unit [Myr] (centmass.dat)
+    global massunitmsun = vals["massunitmsun"]       # code mass unit [M_sun] (particle m_MSUN -> code)
+
+    # Code speed of light from the code velocity unit, computed straight from the file's
+    # own cgs quantities so we inherit exactly CMC's pc/year definitions (no locally
+    # assumed conversion constants). The velocity unit is the DYNAMICAL one:
+    # length / N-body time = lengthunitcgs / nbtimeunitcgs -- the same time unit as
+    # t_conv = nbtimeunitsmyr. NOT timeunitcgs (the code/FP time unit, ~1e6x larger,
+    # which would give a nonsensical c ~ 1e9). c_phys is therefore in cgs (cm/s).
+    c_phys_cgs = 2.99792458e10                                   # cm/s
+    v_unit_cgs = vals["lengthunitcgs"] / vals["nbtimeunitcgs"]   # code velocity unit [cm/s]
+    global c   = c_phys_cgs / v_unit_cgs
+
+    println(">>> Set model constants from conv.sh: $conv_path")
+    println(">>>   c = $c,  t_conv = $t_conv Myr/nbody,  r_conv = $r_conv pc/code,  " *
+            "timeunitsmyr = $timeunitsmyr Myr/code,  massunitmsun = $massunitmsun Msun/code,  " *
+            "v_unit = $(round(v_unit_cgs/1e5, digits=3)) km/s")
+    flush(stdout)
+
+    return (c = c, t_conv = t_conv, r_conv = r_conv,
+            timeunitsmyr = timeunitsmyr, massunitmsun = massunitmsun)
 end
 
 ## Snapshot keys spaced ~`sep` Gyr apart, in time order ##

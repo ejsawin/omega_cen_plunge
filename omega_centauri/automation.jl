@@ -20,9 +20,10 @@ end
 #
 # The file has a header line "#1:t #2:cenma.m #3:Dt ..." then whitespace-separated rows,
 # with the MBH mass in column `cenma.m` and time in column `t`, both in CODE units.
-# `target_time_myr` is in Myr; `myr_per_code` is the Myr per code time unit (e.g. t_conv),
-# used to convert it to code time before interpolating cenma.m linearly (nearest-edge
-# outside the recorded range).
+# `target_time_myr` is in Myr; `myr_per_code` is the Myr per code time unit -- for
+# centmass.dat this is the CODE time unit `timeunitsmyr` (from the .conv.sh, NOT the
+# N-body t_conv) -- used to convert it to code time before interpolating cenma.m linearly
+# (nearest-edge outside the recorded range).
 function get_MBH_mass(centmass_path::AbstractString, target_time_myr::Real, myr_per_code::Real)
 
     centmass_path = expanduser(centmass_path)
@@ -65,12 +66,15 @@ end
 ## Reassigns the same globals main.jl uses; run it fresh (e.g. via run_automated_dc.jl).
 function automate_dc(filename::AbstractString, sep::Real, out_folder::AbstractString,
                      name_prefix::AbstractString; centmass_path::AbstractString,
-                     myr_per_code::Real, n_rv::Integer = 1000, grid_size::Integer = 200)
+                     conv_path::AbstractString, n_rv::Integer = 1000, grid_size::Integer = 200)
 
     global M_bh, dat, psi_tab, psi_tot_tab, M_tab, psi_rtab, psi_Mtot, psi_calc, ETab, DF
 
     filename = expanduser(filename)
     isdir(out_folder) || mkpath(out_folder)
+
+    # Model-dependent constants (c, t_conv, r_conv, timeunitsmyr) once per model.
+    set_model_constants!(conv_path)
 
     snap_keys = snapshot_keys_by_time(filename; sep = sep)
     nsnap = length(snap_keys)
@@ -89,8 +93,9 @@ function automate_dc(filename::AbstractString, sep::Real, out_folder::AbstractSt
             flush(stdout)
 
             try
-                # Update the IMBH mass for this snapshot time (potential + coeffs use M_bh)
-                M_bh = get_MBH_mass(centmass_path, t_gyr * 1000.0, myr_per_code)
+                # Update the IMBH mass for this snapshot time (potential + coeffs use M_bh).
+                # centmass.dat times are in code time units -> convert with timeunitsmyr.
+                M_bh = get_MBH_mass(centmass_path, t_gyr * 1000.0, timeunitsmyr)
                 println("    M_bh = $M_bh (code units)")
                 flush(stdout)
 
@@ -285,7 +290,7 @@ end
 # max_t is in Myr (run_mc_rp_ra now converts to code units internally).
 function automate_mc(snapshot_file::AbstractString, dc_folder::AbstractString, sep::Real,
                      name_prefix::AbstractString, max_t::Real, max_steps::Integer;
-                     centmass_path::AbstractString, myr_per_code::Real,
+                     centmass_path::AbstractString, conv_path::AbstractString,
                      method::Integer = 2, level_low::Integer = 2, level_high::Integer = 11,
                      E_end::Real = -1.5e6, n_E_total::Integer = 300, smooth_sigma::Real = 2.0)
 
@@ -293,6 +298,10 @@ function automate_mc(snapshot_file::AbstractString, dc_folder::AbstractString, s
 
     snapshot_file = expanduser(snapshot_file)
     dc_folder     = expanduser(dc_folder)
+
+    # Model-dependent constants (c, t_conv, r_conv, timeunitsmyr) once per model. Must
+    # match what automate_dc used to build the coefficients/potential for this model.
+    set_model_constants!(conv_path)
 
     snap_keys = snapshot_keys_by_time(snapshot_file; sep = sep)
     nsnap = length(snap_keys)
@@ -333,7 +342,8 @@ function automate_mc(snapshot_file::AbstractString, dc_folder::AbstractString, s
             try
                 # IMBH mass for this snapshot time -- must match what automate_dc used, and
                 # feeds loss_cone / gw_rates / find_Lc and the psi IMBH term below.
-                M_bh = get_MBH_mass(centmass_path, t_gyr * 1000.0, myr_per_code)
+                # centmass.dat times are in code time units -> convert with timeunitsmyr.
+                M_bh = get_MBH_mass(centmass_path, t_gyr * 1000.0, timeunitsmyr)
                 println("    M_bh = $M_bh (code units)")
                 flush(stdout)
 
