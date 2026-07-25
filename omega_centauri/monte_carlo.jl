@@ -55,28 +55,19 @@ function mc_step(E,j,coef,m_obj)
     t_gwE = abs(E / dE_GW)           # GW on E
     t_jj  = j^2 / max(djj_NR, 0.0)   # L-diffusion (in j)
 
-    # Two regimes. When the GW timescale drops below one orbit (t_gwE < period),
-    # dE_GW*period > |E|: the orbit-averaged Peters rate is past its validity, because
-    # GW is really a discrete kick delivered once per orbit at pericenter, not a smooth
-    # drift. There we step on the diffusion-limited dt (GW excluded) and deliver the
-    # full per-orbit GW burst only when the walker actually reaches pericenter this
-    # step (probability check_lc = dt/period); the driver tests the loss cone on that
-    # same event. Otherwise (GW slow, many orbits) integrate GW continuously.
-    #
-    # Paper: N_safe = (1/F_safe) min(E/dE_GW, sqrt(L^2/(<dL^2>_o P))). The linear GW
-    # term is dropped in the plunge regime, where GW is delivered as a per-pericenter
-    # burst rather than limiting the step.
-    plunge = t_gwE < period
-
-    if plunge
-        N_safe = (1/F_safe) * sqrt(t_jj / period)
-        # Cap at one orbit: off-grid (djj = 0) gives N_safe = Inf, and dt/period must
-        # stay <= 1 to be a valid pericenter-reach probability.
-        dt = min(N_safe, 1.0) * period
-    else
-        N_safe = (1/F_safe) * min(t_gwE / period, sqrt(t_jj / period))
-        dt = N_safe * period
+    # Ignore degenerate L-diffusion timescales (t_jj = 0, Inf, or NaN -- e.g. djj_NR <= 0
+    # off-grid, or j -> 0). The diffusion step is ill-defined there, so bail with the
+    # sentinel; the furball / driver then drops this sample rather than guessing a step.
+    if !isfinite(t_jj) || t_jj <= 0.0
+        return -100.0, -100.0, 1000, 1000, false
     end
+
+    # Single step limiter (NO plunge branch): GW (t_gwE) and L-diffusion (t_jj) both cap
+    # it. At least one full orbit, no upper cap -- the diffusion coeffs are orbit-averaged,
+    # so a sub-orbital step would misuse them.
+    plunge = t_gwE < period   # unused here; kept only for the commented-out pinhole block
+    N_safe = (1/F_safe) * min(t_gwE / period, sqrt(t_jj / period))
+    dt = isfinite(N_safe) ? max(N_safe, 1.0) * period : period
 
     denom = sqrt(abs(dEE_NR * djj_NR))
 
@@ -115,6 +106,15 @@ function mc_step(E,j,coef,m_obj)
     rc_new, Lc_new = find_Lc(E_new)
     L_new = j_new * Lc_new
 
+    # === TEMP (pinhole merger-count test) ===================================
+    # The pinhole-aware loss-cone treatment below -- probabilistic once-per-orbit
+    # pericenter gating (check_lc), the plunge per-pericenter GW burst, and the
+    # pre-burst capture test -- is commented out. In its place (further down): GW
+    # integrated CONTINUOUSLY and the loss cone tested DIRECTLY every step, with no
+    # dt/period probability. This overcounts relative to the per-orbit treatment and
+    # lets walkers "fly away"; both are intentional for this test. To restore the
+    # proper treatment, un-comment the #= ... =# block and delete the naive block.
+    #=
     # Reached pericenter this step? Once per orbit on average.
     check_lc = rand() < dt / period
 
@@ -148,6 +148,35 @@ function mc_step(E,j,coef,m_obj)
     # small perturbation here, so pre/post are equivalent).
     if !plunge && check_lc && reflect_j(j_step) <= loss_cone(E_step)
         return E_step, j_step, dt, period, true
+    end
+
+    return E_step, j_step, dt, period, false
+    =#
+
+    # --- Naive treatment: continuous GW + direct loss-cone check every step ---
+    E_step = E_new + dE_GW * dt
+    L_step = L_new + dL_GW * dt
+
+    rc_step, Lc_step = find_Lc(E_step)
+    j_step = L_step / Lc_step
+
+    # Disregard pathological j BEFORE the loss-cone test: j outside the single-reflection
+    # range [-1, 2] (or non-finite) is unphysical -- a huge one-orbit diffusion kick --
+    # and reflect_j would ALIAS it into the loss cone (e.g. j = 9.9 -> 2 - 9.9 = -7.9,
+    # which is <= j_lc, a spurious "capture"). Return it NOT captured with the raw j so the
+    # driver's pathological-j guard logs it distinctly ("pathological j = ...") and ends
+    # the walker as reason -100 -- rather than aliasing it into a merger, OR (as the plain
+    # sentinel did) mislabeling this fly-away as an "uncharacterizable orbit".
+    if !isfinite(j_step) || j_step < -1.0 || j_step > 2.0
+        return E_step, j_step, dt, period, false
+    end
+
+    # Direct loss-cone capture: no dt/period probability, tested every step. Return the
+    # REFLECTED j (j_step can be a small negative, e.g. -1.8e-4; reflect_j maps it to its
+    # physical positive value) so the driver's log, the stored j, and its find_rp_ra
+    # (L = j*Lc) all see j > 0 instead of a spurious negative.
+    if reflect_j(j_step) <= loss_cone(E_step)
+        return E_step, reflect_j(j_step), dt, period, true
     end
 
     return E_step, j_step, dt, period, false
@@ -275,9 +304,15 @@ function run_mc_rp_ra(E0, j0, coef, m_obj; max_step=100, max_t=Inf)
             break
         end
 
-        # Captured: mc_step tested the loss cone at pericenter (pre-burst).
+        # Captured: mc_step tested the loss cone at pericenter (pre-burst). Store the
+        # crossing point (E_new, j_new) as the FINAL step before stopping -- otherwise
+        # es/js/rps/ras end one step short of the loss cone and plots never reach it.
         if captured
             reason = 1
+            n += 1
+            E_stor[n], j_stor[n], t_stor[n] = E_new, j_new, t + dt
+            _, Lc_c = find_Lc(E_new)
+            rp_stor[n], ra_stor[n] = find_rp_ra(E_new, j_new * Lc_c)
             println("Entered loss cone (j = $j_new, E = $E_new) at step $step")
             break
         end
@@ -323,6 +358,168 @@ function run_mc_rp_ra(E0, j0, coef, m_obj; max_step=100, max_t=Inf)
     end
 
     return t_conv .* t_stor[1:n], E_stor[1:n], j_stor[1:n], rp_stor[1:n], ra_stor[1:n], reason
+end
+
+
+## --- Mean-drift "flow field" diagnostic (Fokker-Planck streamlines) --- ##
+#
+# Trace the ENSEMBLE-MEAN trajectory of a walker in (E, j). At each point, run `n_furball`
+# independent single mc_step realizations from the SAME (E, j), collapse that cloud (the
+# "furball") to its centroid, and step deterministically to the centroid; then repeat from
+# there. Averaging cancels the diffusive spread and leaves only the systematic drift, so
+# the path is a streamline of the mean flow -- a clean way to see whether the (loaded)
+# diffusion coefficients push walkers sensibly toward the loss cone or do something
+# pathological (stall, reverse, run away in E).
+#
+# All mc_step physics is kept (drift + GW + reflection + loss-cone capture). The centroid
+# includes captured and escaped members, so the mean flows into the loss cone naturally as
+# the capture fraction turns on near the boundary. Because every furball member starts from
+# the same (E, j), they share one deterministic timestep dt, so the recorded time is the
+# drift time. There is no physical time limit -- termination is loss cone / escape / max_step.
+#
+# Returns per-step arrays E, j, t[Myr], rp, ra, captured-fraction, and a termination reason
+# (1 = loss cone, 2 = unused, -100 = escaped / uncharacterizable, 3 = reached max_step).
+function mc_mean_flow(E0, j0, coef, m_obj;
+                      n_furball::Integer = 1000, max_step::Integer = 5000)
+
+    E_stor    = Float64[]
+    j_stor    = Float64[]
+    t_stor    = Float64[]      # cumulative drift time [Myr]
+    rp_stor   = Float64[]
+    ra_stor   = Float64[]
+    fcap_stor = Float64[]
+
+    E, j, t = E0, j0, 0.0
+    reason  = 3                # default: reached max_step
+
+    # Record the starting point.
+    _, Lc0 = find_Lc(E)
+    rp0, ra0 = find_rp_ra(E, clamp(j, 1.0e-7, 1.0) * Lc0)
+    push!(E_stor, E); push!(j_stor, j); push!(t_stor, t_conv * t)
+    push!(rp_stor, rp0); push!(ra_stor, ra0); push!(fcap_stor, 0.0)
+
+    for step in 1:max_step
+
+        # Terminate on the mean state.
+        j_lc = loss_cone(E)
+        if isfinite(j_lc) && j <= j_lc
+            reason = 1
+            break
+        elseif E >= 0.0 || E <= -1.0e7
+            reason = -100
+            break
+        end
+
+        # Furball: n_furball single mc_steps from (E, j), collapsed to the centroid.
+        sumE = 0.0; sumj = 0.0; sumdt = 0.0
+        nvalid = 0; ncap = 0
+        for _ in 1:n_furball
+            E_new, j_new, dt, period, captured = mc_step(E, j, coef, m_obj)
+
+            (E_new == -100.0 && j_new == -100.0) && continue          # sentinel orbit
+            (isfinite(E_new) && isfinite(j_new) && isfinite(dt)) || continue
+
+            jr = reflect_j(j_new)                                     # captured j already reflected
+            (jr < -1.0 || jr > 2.0) && continue                       # pathological
+
+            sumE += E_new; sumj += jr; sumdt += dt
+            nvalid += 1
+            captured && (ncap += 1)
+        end
+
+        if nvalid == 0
+            reason = -100
+            break
+        end
+
+        E = sumE / nvalid
+        j = sumj / nvalid
+        t += sumdt / nvalid        # dt is identical across members -> this is that dt
+
+        _, Lc = find_Lc(E)
+        rp, ra = find_rp_ra(E, clamp(j, 1.0e-7, 1.0) * Lc)
+        push!(E_stor, E); push!(j_stor, j); push!(t_stor, t_conv * t)
+        push!(rp_stor, rp); push!(ra_stor, ra); push!(fcap_stor, ncap / n_furball)
+    end
+
+    return E_stor, j_stor, t_stor, rp_stor, ra_stor, fcap_stor, reason
+end
+
+
+## --- One furball "step": mean displacement (drift vector) at a fixed (E, j) --- ##
+#
+# Run `n_furball` independent single mc_steps from the SAME (E, j) and return the MEAN
+# displacement (dE, dj) -- the local drift vector of the Fokker-Planck flow -- plus the
+# captured fraction. Averaging cancels the diffusive spread, leaving the systematic
+# direction. Used to build a gradient/quiver field over an (E, j) grid: each grid point
+# gets exactly one furball, with NO time integration (see run_mean_flow.jl). Captured
+# members (which jump to the loss cone) are included, so the vector turns into the cone
+# near the boundary. Returns NaN displacement if no member produced a usable step.
+function mc_furball_step(E, j, coef, m_obj; n_furball::Integer = 1000)
+
+    # Rule 1: a grid point that STARTS inside (or on) the loss cone is already a plunge --
+    # don't compute a vector there at all. (loss_cone is NaN where undefined, e.g. E >= 0;
+    # treat that as skip too.)
+    j_lc = loss_cone(E)
+    if !isfinite(j_lc) || j <= j_lc
+        return (dE = NaN, dj = NaN, fcap = NaN, n = 0)
+    end
+
+    # Rule 2: a grid point OUTSIDE the loss cone runs the full furball and counts EVERY
+    # random walk -- including members that diffuse INTO the loss cone (captured=true, whose
+    # returned j is the loss-cone value) -- so the mean vector reflects the true flux toward
+    # the boundary. Only pathological fly-aways (j outside [-1, 2]) are dropped.
+    sumdE = 0.0; sumdj = 0.0
+    nvalid = 0; ncap = 0
+    for _ in 1:n_furball
+        E_new, j_new, dt, period, captured = mc_step(E, j, coef, m_obj)
+        (E_new == -100.0 && j_new == -100.0) && continue          # sentinel orbit
+        (isfinite(E_new) && isfinite(j_new)) || continue
+        jr = reflect_j(j_new)                                     # captured j already reflected
+        (jr < -1.0 || jr > 2.0) && continue                       # pathological fly-away
+        sumdE += E_new - E
+        sumdj += jr - j
+        nvalid += 1
+        captured && (ncap += 1)
+    end
+    nvalid == 0 && return (dE = NaN, dj = NaN, fcap = NaN, n = 0)
+    return (dE = sumdE / nvalid, dj = sumdj / nvalid, fcap = ncap / n_furball, n = nvalid)
+end
+
+
+## --- Deterministic drift vector at (E, j): the Fokker-Planck first moment (a RATE) --- ##
+#
+# The instantaneous mean drift (dE/dt, dj/dt) = diffusion drift (Dj1/DE1 coeffs, already in
+# (E,j) space) + GW drift (Peters, transformed from (E,L) to j-space via the Jacobian of
+# j = L/Jc(E): dj/dt = (dL/dt - j (dJc/dE) dE/dt)/Jc). This is the EXACT drift field -- no
+# stochastic step, no timestep, no capture/overshoot exclusion -- so it is the right
+# quantity for a gradient/quiver plot, and GW cleanly dominates near the loss cone where
+# the Peters rate blows up. Rule 1: NaN inside the loss cone. Returns the total drift plus
+# the GW-only and diffusion-only pieces so their relative size can be checked directly.
+function mc_drift(E, j, coef, m_obj)
+    nanret = (dE = NaN, dj = NaN, dE_gw = NaN, dj_gw = NaN, dE_nr = NaN, dj_nr = NaN)
+
+    j_lc = loss_cone(E)
+    (!isfinite(j_lc) || j <= j_lc) && return nanret          # Rule 1: inside the cone
+
+    rc, Lc = find_Lc(E)
+    L = j * Lc
+    rp, ra = find_rp_ra(E, L)
+    orbit_failed(rp, ra) && return nanret
+    a = (rp + ra) / 2
+    e = (ra - rp) / (ra + rp)
+    (!isfinite(a) || !isfinite(e) || a <= 0 || e < 0 || e >= 1) && return nanret
+
+    # Diffusion drift (orbit-averaged, already transformed into (E,j) space).
+    dE_nr = coef.DE1_samp(j, E) + m_obj * coef.DE2_samp(j, E)
+    dj_nr = coef.Dj1_samp(j, E) + m_obj * coef.Dj2_samp(j, E)
+
+    # GW (Peters) drift, transformed (E, L) -> j-space.
+    dE_gw, dL_gw = gw_rates(a, e, m_obj)
+    dj_gw = (dL_gw - j * dLc_dE(E) * dE_gw) / Lc
+
+    return (dE = dE_nr + dE_gw, dj = dj_nr + dj_gw,
+            dE_gw = dE_gw, dj_gw = dj_gw, dE_nr = dE_nr, dj_nr = dj_nr)
 end
 
 
