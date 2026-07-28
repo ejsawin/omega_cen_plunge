@@ -55,6 +55,21 @@ function get_MBH_mass(centmass_path::AbstractString, target_time_myr::Real, myr_
     return _interp1(target_code, times, masses)     # linear interp, nearest at the ends
 end
 
+## Restrict snapshot keys to a time window (Gyr) for splitting a run across HPC jobs. ##
+#
+# `timeinterval` is (tmin, tmax) in Gyr, or nothing (whole series). Each snapshot's time is
+# ROUNDED to the nearest `sep` before comparison (undoing the round-value jitter, e.g.
+# 2.5002 -> 2.5), so interval (0.1, 2.5) cleanly takes 0.1..2.5 Gyr and (2.6, 5.0) takes
+# 2.6..5.0 with no gap or overlap. Returns (filtered_keys, filename_suffix); the suffix
+# ("_<tmin>-<tmax>Gyr", or "" for the whole series) tags the shared per-run output files so
+# concurrent jobs don't clobber each other. Per-snapshot files are named by time and never collide.
+function _apply_time_interval(snap_keys, sep, timeinterval)
+    timeinterval === nothing && return snap_keys, ""
+    tmin, tmax = timeinterval
+    kept = filter(k -> tmin - 1e-6 <= round(_snapshot_time(k) / sep) * sep <= tmax + 1e-6, snap_keys)
+    return kept, "_$(_time_tag(tmin))-$(_time_tag(tmax))Gyr"
+end
+
 ## Process every snapshot spaced ~`sep` Gyr apart: build the orbit-sampled potential
 ## and diffusion coefficients for each, saving into `out_folder`:
 ##   <prefix>_<time>Gyr.h5          -- diffusion coefficients (grid_size x grid_size)
@@ -66,7 +81,8 @@ end
 ## Reassigns the same globals main.jl uses; run it fresh (e.g. via run_automated_dc.jl).
 function automate_dc(filename::AbstractString, sep::Real, out_folder::AbstractString,
                      name_prefix::AbstractString; centmass_path::AbstractString,
-                     conv_path::AbstractString, n_rv::Integer = 1000, grid_size::Integer = 200)
+                     conv_path::AbstractString, n_rv::Integer = 1000, grid_size::Integer = 200,
+                     timeinterval::Union{Nothing, Tuple{Real,Real}} = nothing)
 
     global M_bh, dat, psi_tab, psi_tot_tab, M_tab, psi_rtab, psi_Mtot, psi_calc, ETab, DF
 
@@ -77,12 +93,14 @@ function automate_dc(filename::AbstractString, sep::Real, out_folder::AbstractSt
     set_model_constants!(conv_path)
 
     snap_keys = snapshot_keys_by_time(filename; sep = sep)
+    snap_keys, isuffix = _apply_time_interval(snap_keys, sep, timeinterval)
     nsnap = length(snap_keys)
-    println("automate_dc: $nsnap snapshots (sep = $sep Gyr) from $filename")
+    println("automate_dc: $nsnap snapshots (sep = $sep Gyr) from $filename" *
+            (timeinterval === nothing ? "" : "  [interval $(timeinterval[1])-$(timeinterval[2]) Gyr]"))
     println("  output -> $out_folder,  prefix = $name_prefix,  n_rv = $n_rv,  grid = $grid_size")
     flush(stdout)
 
-    potential_file = joinpath(out_folder, "$(name_prefix)_lowest101_potentials.h5")
+    potential_file = joinpath(out_folder, "$(name_prefix)_lowest101_potentials$(isuffix).h5")
 
     h5open(potential_file, "w") do pf
         for (i, key) in enumerate(snap_keys)
@@ -283,7 +301,9 @@ end
 # For each snapshot (spaced ~`sep` Gyr): load <prefix>_<time>Gyr.h5 (coeffs) and
 # <prefix>_<time>Gyr_rv_psi.h5 (potential) from `dc_folder`, optionally extrapolate the
 # coefficients below the data (method = 2, default), seed one walker per bound BH/NS from
-# `snapshot_file`, integrate to (max_t, max_steps), and store the FINAL state per walker.
+# `snapshot_file`, integrate to (max_t, max_steps), and store the FINAL state per walker,
+# plus the FULL per-step trajectory of every walker that ended in the loss cone (reason 1),
+# under a `traj/<k>` subgroup keyed by the walker's 1-based position.
 # Output: <dc_folder>/<prefix>_mc.h5, one group per snapshot.
 #   method = 1 : no coefficient extrapolation (assume no diffusion below the data)
 #   method = 2 : power-law extrapolate over [ETab[level_low], ETab[level_high]] down to E_end
@@ -292,7 +312,9 @@ function automate_mc(snapshot_file::AbstractString, dc_folder::AbstractString, s
                      name_prefix::AbstractString, max_t::Real, max_steps::Integer;
                      centmass_path::AbstractString, conv_path::AbstractString,
                      method::Integer = 2, level_low::Integer = 2, level_high::Integer = 11,
-                     E_end::Real = -1.5e6, n_E_total::Integer = 300, smooth_sigma::Real = 2.0)
+                     E_end::Real = -1.5e6, n_E_total::Integer = 300, smooth_sigma::Real = 2.0,
+                     timeinterval::Union{Nothing, Tuple{Real,Real}} = nothing,
+                     compute_rp_ra::Bool = false)
 
     global M_bh
 
@@ -304,10 +326,12 @@ function automate_mc(snapshot_file::AbstractString, dc_folder::AbstractString, s
     set_model_constants!(conv_path)
 
     snap_keys = snapshot_keys_by_time(snapshot_file; sep = sep)
+    snap_keys, isuffix = _apply_time_interval(snap_keys, sep, timeinterval)
     nsnap = length(snap_keys)
-    out_file = joinpath(dc_folder, "$(name_prefix)_mc.h5")
+    out_file = joinpath(dc_folder, "$(name_prefix)_mc$(isuffix).h5")
 
-    println("automate_mc: $nsnap snapshots (sep = $sep Gyr), method = $method")
+    println("automate_mc: $nsnap snapshots (sep = $sep Gyr), method = $method" *
+            (timeinterval === nothing ? "" : "  [interval $(timeinterval[1])-$(timeinterval[2]) Gyr]"))
     println("  snapshots: $snapshot_file")
     println("  coeffs/psi: $dc_folder,  output: $out_file")
     flush(stdout)
@@ -360,7 +384,9 @@ function automate_mc(snapshot_file::AbstractString, dc_folder::AbstractString, s
                         E_end = E_end, n_E_total = n_E_total, smooth_sigma = smooth_sigma)
                 end
 
-                # One walker per bound BH/NS; integrate and keep the final state.
+                # One walker per bound BH/NS; integrate and keep the final state. For
+                # walkers that end in the loss cone (reason == 1) also keep the FULL
+                # per-step trajectory; all others keep `nothing` (bounded memory).
                 ics = black_hole_ics(dat_s)
                 N   = length(ics.indices)
                 Ef  = Vector{Float64}(undef, N)
@@ -368,14 +394,24 @@ function automate_mc(snapshot_file::AbstractString, dc_folder::AbstractString, s
                 rpf = Vector{Float64}(undef, N)
                 raf = Vector{Float64}(undef, N)
                 reasons = Vector{Int}(undef, N)
+                traj_t  = Vector{Union{Nothing,Vector{Float64}}}(nothing, N)
+                traj_E  = Vector{Union{Nothing,Vector{Float64}}}(nothing, N)
+                traj_j  = Vector{Union{Nothing,Vector{Float64}}}(nothing, N)
+                traj_rp = Vector{Union{Nothing,Vector{Float64}}}(nothing, N)
+                traj_ra = Vector{Union{Nothing,Vector{Float64}}}(nothing, N)
 
                 Threads.@threads :dynamic for k in 1:N
                     ts, es, js, rps, ras, reason =
                         run_mc_rp_ra(ics.E0[k], ics.J0[k], coef, ics.m0[k];
-                                     max_step = max_steps, max_t = max_t)
+                                     max_step = max_steps, max_t = max_t,
+                                     compute_rp_ra = compute_rp_ra)
                     Ef[k] = es[end]; jf[k] = js[end]
                     rpf[k] = rps[end]; raf[k] = ras[end]
                     reasons[k] = reason
+                    if reason == 1   # entered loss cone -> retain the whole trajectory
+                        traj_t[k]  = ts;  traj_E[k]  = es;  traj_j[k] = js
+                        traj_rp[k] = rps; traj_ra[k] = ras
+                    end
                 end
 
                 g = create_group(of, "$(tag)Gyr")
@@ -387,6 +423,29 @@ function automate_mc(snapshot_file::AbstractString, dc_folder::AbstractString, s
                 g["Ef"]  = Ef;      g["jf"]  = jf
                 g["rpf"] = rpf;     g["raf"] = raf
                 g["reason_to_end"] = reasons
+
+                # Full trajectories of loss-cone walkers only (reason_to_end == 1). One
+                # subgroup per such walker, keyed by its 1-based position k in
+                # indices/E0s/J0s/m0s. Arrays are per-MC-step (last entry = loss-cone
+                # crossing); t is in Myr (t_conv * code time), E/j the walker state,
+                # rp/ra peri/apocenter in code length units.
+                tg = create_group(g, "traj")
+                ncap = 0
+                for k in 1:N
+                    traj_t[k] === nothing && continue
+                    ncap += 1
+                    wk = create_group(tg, string(k))
+                    attrs(wk)["orig_index"] = ics.indices[k]
+                    attrs(wk)["m"]  = ics.m0[k]
+                    attrs(wk)["E0"] = ics.E0[k]
+                    attrs(wk)["J0"] = ics.J0[k]
+                    wk["t"]  = traj_t[k]
+                    wk["E"]  = traj_E[k]
+                    wk["j"]  = traj_j[k]
+                    wk["rp"] = traj_rp[k]
+                    wk["ra"] = traj_ra[k]
+                end
+                attrs(tg)["n_captured"] = ncap
                 flush(of)
 
                 println("    $N walkers integrated")

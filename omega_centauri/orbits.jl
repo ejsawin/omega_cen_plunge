@@ -542,8 +542,14 @@ end
 
 
 function find_period(E, L)
-
     rp, ra = find_rp_ra(E, L)
+    return find_period(E, L, rp, ra)
+end
+
+# Same period integral, but reusing already-computed turning points (rp, ra). mc_step
+# already calls find_rp_ra for its orbit characterization, so passing them in here avoids
+# a second (expensive) bisection per MC step.
+function find_period(E, L, rp, ra)
 
     if orbit_failed(rp, ra)
         return -100.0

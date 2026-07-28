@@ -22,15 +22,13 @@ function mc_step(E,j,coef,m_obj)
         return -100.0, -100.0, 1000, 1000, false
     end
     
-    period = find_period(E, L)
-    
+    period = find_period(E, L, rp, ra)   # reuse rp, ra from above (skips a 2nd find_rp_ra)
+
     if !isfinite(period) || period <= 0
         return -100.0, -100.0, 1000, 1000, false
     end
-    
-    period = find_period(E,L)
-    a = (ra + rp) / 2
-    e = (ra - rp) / (ra + rp)
+    # (period, a, e are already set above -- the duplicate find_period/a/e recompute was
+    #  removed; find_period does root-finding/integration, so this is one fewer per step.)
 
     # Orbit averaged diff coeffs (per unit time!)
     dE_NR = coef.DE1_samp(j,E) + m_obj * coef.DE2_samp(j,E)
@@ -215,7 +213,7 @@ function run_mc(E0, j0, coef, m_obj; max_step=100, max_t=Inf)
         j_lc = loss_cone(E)
 
         if j <= j_lc
-            println("Entered loss cone (j = $j, j_lc = $j_lc)")
+            println("Entered loss cone (j = $j, j_lc = $j_lc, M = $m_obj)")
             break
         elseif E >= 0.0 || t >= max_t_code
             break
@@ -243,7 +241,13 @@ function run_mc(E0, j0, coef, m_obj; max_step=100, max_t=Inf)
 end
 
 
-function run_mc_rp_ra(E0, j0, coef, m_obj; max_step=100, max_t=Inf)
+# compute_rp_ra: if true (default, for manual single-snapshot testing) compute rp/ra every
+# step for every walker. If false (automate_mc batch runs) skip the per-step find_Lc +
+# find_rp_ra -- the dominant cost -- and only backfill rp/ra for walkers that end in the
+# loss cone (~1% of walkers), which are the only trajectories saved. The final rp/ra of a
+# captured walker is set at the crossing regardless, so its summary rpf/raf stays correct;
+# non-captured walkers get NaN rp/ra (discarded downstream).
+function run_mc_rp_ra(E0, j0, coef, m_obj; max_step=100, max_t=Inf, compute_rp_ra=true)
 
     # max_t is in Myr; the internal clock t is in code (Henon) units, so convert once.
     max_t_code = max_t / t_conv
@@ -271,14 +275,14 @@ function run_mc_rp_ra(E0, j0, coef, m_obj; max_step=100, max_t=Inf)
     j_lc0 = loss_cone(E)
     if j <= j_lc0
         reason = 1
-        println("Entered loss cone (j = $j, j_lc = $j_lc0)")
+        println("Entered loss cone (j = $j, j_lc = $j_lc0, M = $m_obj)")
         return t_conv .* t_stor[1:n], E_stor[1:n], j_stor[1:n],
                rp_stor[1:n], ra_stor[1:n], reason
     end
 
     for step in 1:max_step
 
-        if E <= -10000000
+        if E <= -1000000000
             reason = -100
             println(stderr, "REASON -100: below potential minimum (E = $E) at step $step; ending walker early.")
             flush(stderr)
@@ -313,7 +317,7 @@ function run_mc_rp_ra(E0, j0, coef, m_obj; max_step=100, max_t=Inf)
             E_stor[n], j_stor[n], t_stor[n] = E_new, j_new, t + dt
             _, Lc_c = find_Lc(E_new)
             rp_stor[n], ra_stor[n] = find_rp_ra(E_new, j_new * Lc_c)
-            println("Entered loss cone (j = $j_new, E = $E_new) at step $step")
+            println("Entered loss cone (j = $j_new, E = $E_new, M = $m_obj) at step $step")
             break
         end
 
@@ -350,11 +354,28 @@ function run_mc_rp_ra(E0, j0, coef, m_obj; max_step=100, max_t=Inf)
         n += 1
 
         E_stor[n], j_stor[n], t_stor[n] = E, j, t
-        rc, Lc = find_Lc(E)
+        # Per-step rp/ra (find_Lc + find_rp_ra) is the dominant cost but only matters for
+        # walkers that reach the loss cone. With compute_rp_ra=false skip it here (store NaN)
+        # and backfill the captured trajectory after the loop.
+        if compute_rp_ra
+            rc, Lc = find_Lc(E)
+            rp, ra = find_rp_ra(E, j*Lc)
+            rp_stor[n], ra_stor[n] = rp, ra
+        else
+            rp_stor[n], ra_stor[n] = NaN, NaN
+        end
+        #println("E = $E, j = $j, t = $t")
+    end
 
-        rp, ra = find_rp_ra(E, j*Lc)
-        rp_stor[n], ra_stor[n] = rp, ra
-        #println("E = $E, j = $j, t = $t, rp = $rp, ra = $ra")
+    # If per-step rp/ra were skipped but this walker ended in the loss cone, backfill its
+    # full trajectory now (captured walks are ~1% and short, so this is cheap). This
+    # reproduces exactly what the per-step path would have stored. The IC-start-in-cone
+    # path returns earlier with rp_stor[1] already set at the top, so it is unaffected.
+    if !compute_rp_ra && reason == 1
+        @inbounds for i in 1:n
+            _, Lc_i = find_Lc(E_stor[i])
+            rp_stor[i], ra_stor[i] = find_rp_ra(E_stor[i], j_stor[i] * Lc_i)
+        end
     end
 
     return t_conv .* t_stor[1:n], E_stor[1:n], j_stor[1:n], rp_stor[1:n], ra_stor[1:n], reason
@@ -487,6 +508,17 @@ function mc_furball_step(E, j, coef, m_obj; n_furball::Integer = 1000)
 end
 
 
+## Semimajor axis a = (rp+ra)/2 at (E, j); NaN if the orbit can't be characterized. ##
+function _semimajor(E, j)
+    (isfinite(E) && E < 0.0 && isfinite(j) && j > 0.0) || return NaN
+    _, Lc = find_Lc(E)
+    (isfinite(Lc) && Lc > 0.0) || return NaN
+    rp, ra = find_rp_ra(E, j * Lc)
+    orbit_failed(rp, ra) && return NaN
+    return (rp + ra) / 2
+end
+
+
 ## --- Deterministic drift vector at (E, j): the Fokker-Planck first moment (a RATE) --- ##
 #
 # The instantaneous mean drift (dE/dt, dj/dt) = diffusion drift (Dj1/DE1 coeffs, already in
@@ -497,7 +529,8 @@ end
 # the Peters rate blows up. Rule 1: NaN inside the loss cone. Returns the total drift plus
 # the GW-only and diffusion-only pieces so their relative size can be checked directly.
 function mc_drift(E, j, coef, m_obj)
-    nanret = (dE = NaN, dj = NaN, dE_gw = NaN, dj_gw = NaN, dE_nr = NaN, dj_nr = NaN)
+    nanret = (dE = NaN, dj = NaN, dE_gw = NaN, dj_gw = NaN, dE_nr = NaN, dj_nr = NaN,
+              a = NaN, da = NaN, da_gw = NaN, da_nr = NaN)
 
     j_lc = loss_cone(E)
     (!isfinite(j_lc) || j <= j_lc) && return nanret          # Rule 1: inside the cone
@@ -518,8 +551,23 @@ function mc_drift(E, j, coef, m_obj)
     dE_gw, dL_gw = gw_rates(a, e, m_obj)
     dj_gw = (dL_gw - j * dLc_dE(E) * dE_gw) / Lc
 
+    # (E, j) -> (a, j) transform: a = (rp+ra)/2, so da/dt = (da/dE) dE/dt + (da/dj) dj/dt.
+    # Central finite differences with tiny relative steps -- the perturbed points stay
+    # outside the cone (j > j_lc), so they characterize; if one fails, that partial (hence
+    # da) becomes NaN, which the plot skips. The grid stays (E, j); a/da are just for
+    # plotting in (a, j).
+    hE = 1.0e-4 * abs(E)
+    hj = 1.0e-4 * j
+    dAdE = (_semimajor(E + hE, j) - _semimajor(E - hE, j)) / (2 * hE)
+    dAdj = (_semimajor(E, j + hj) - _semimajor(E, j - hj)) / (2 * hj)
+
+    da    = dAdE * (dE_nr + dE_gw) + dAdj * (dj_nr + dj_gw)
+    da_gw = dAdE * dE_gw + dAdj * dj_gw
+    da_nr = dAdE * dE_nr + dAdj * dj_nr
+
     return (dE = dE_nr + dE_gw, dj = dj_nr + dj_gw,
-            dE_gw = dE_gw, dj_gw = dj_gw, dE_nr = dE_nr, dj_nr = dj_nr)
+            dE_gw = dE_gw, dj_gw = dj_gw, dE_nr = dE_nr, dj_nr = dj_nr,
+            a = a, da = da, da_gw = da_gw, da_nr = da_nr)
 end
 
 
