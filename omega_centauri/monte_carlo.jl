@@ -45,8 +45,8 @@ function mc_step(E,j,coef,m_obj)
     dE_tot = dE_NR + dE_GW
     dj_tot = dj_NR + dj_GW
 
-    # Step Size
-    F_safe = 10 # step covers N = max(1, N_safe) orbits (paper default; tested 3-30)
+    # Step Size. F_safe is a typed global (default 10, settable via automate_mc for
+    # convergence tests); read here instead of a hardcoded local. N = max(1, N_safe) orbits.
 
     # Paper's two timescales: GW on E, and L-diffusion (in j here). t_jj is clamped
     # >= 0 so noisy interpolation can't give a negative timescale (-> Inf = unconstrained).
@@ -180,6 +180,12 @@ function mc_step(E,j,coef,m_obj)
     return E_step, j_step, dt, period, false
 
 end
+
+## Set the MC step-size safety factor F_safe (the typed global mc_step reads). Use this
+## rather than `global F_safe = ...` from a scope that also has an F_safe local/kwarg --
+## there the `global` declaration makes every F_safe reference the global and the intended
+## value is silently dropped. The argument here is named `x`, so there is no such clash.
+set_F_safe!(x::Real) = (global F_safe = float(x); return nothing)
 
 ## Reflecting boundary: single reflection at j = 0 and j = 1 (for j in [-1, 2]) ##
 function reflect_j(j)
@@ -365,6 +371,14 @@ function run_mc_rp_ra(E0, j0, coef, m_obj; max_step=100, max_t=Inf, compute_rp_r
             rp_stor[n], ra_stor[n] = NaN, NaN
         end
         #println("E = $E, j = $j, t = $t")
+    end
+
+    # Reached the step cap without capture (1), timeout (2), or an error (-100): reason stays
+    # at its default 3. Log it so these show up in the error log like the other exit reasons.
+    if reason == 3
+        println(stderr, "REASON 3: reached max_step ($max_step) without capture or timeout " *
+                        "(E = $E, j = $j, M = $m_obj); ending walker.")
+        flush(stderr)
     end
 
     # If per-step rp/ra were skipped but this walker ended in the loss cone, backfill its

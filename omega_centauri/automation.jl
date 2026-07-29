@@ -314,7 +314,8 @@ function automate_mc(snapshot_file::AbstractString, dc_folder::AbstractString, s
                      method::Integer = 2, level_low::Integer = 2, level_high::Integer = 11,
                      E_end::Real = -1.5e6, n_E_total::Integer = 300, smooth_sigma::Real = 2.0,
                      timeinterval::Union{Nothing, Tuple{Real,Real}} = nothing,
-                     compute_rp_ra::Bool = false)
+                     compute_rp_ra::Bool = false, F_safe::Real = 10,
+                     out_prefix::AbstractString = name_prefix)
 
     global M_bh
 
@@ -325,12 +326,22 @@ function automate_mc(snapshot_file::AbstractString, dc_folder::AbstractString, s
     # match what automate_dc used to build the coefficients/potential for this model.
     set_model_constants!(conv_path)
 
+    # MC step-size safety factor read by mc_step (global). Set once here (the threaded
+    # walker loop only reads it) so a convergence test can sweep it via
+    # automate_mc(...; F_safe = ...). Default 10 reproduces the previous hardcoded value.
+    # NB: use set_F_safe! -- a bare `global F_safe = float(F_safe)` here would clash with
+    # the F_safe kwarg and silently keep the global unchanged.
+    set_F_safe!(F_safe)
+
     snap_keys = snapshot_keys_by_time(snapshot_file; sep = sep)
     snap_keys, isuffix = _apply_time_interval(snap_keys, sep, timeinterval)
     nsnap = length(snap_keys)
-    out_file = joinpath(dc_folder, "$(name_prefix)_mc$(isuffix).h5")
+    # name_prefix names the INPUT coeff/psi files (read below); out_prefix names the OUTPUT
+    # (defaults to name_prefix). Separate them to write a convergence-test run to a distinct
+    # file while reusing the same DC coefficients, e.g. out_prefix = "OCen_Fsafe25".
+    out_file = joinpath(dc_folder, "$(out_prefix)_mc$(isuffix).h5")
 
-    println("automate_mc: $nsnap snapshots (sep = $sep Gyr), method = $method" *
+    println("automate_mc: $nsnap snapshots (sep = $sep Gyr), method = $method, F_safe = $F_safe" *
             (timeinterval === nothing ? "" : "  [interval $(timeinterval[1])-$(timeinterval[2]) Gyr]"))
     println("  snapshots: $snapshot_file")
     println("  coeffs/psi: $dc_folder,  output: $out_file")
@@ -346,6 +357,7 @@ function automate_mc(snapshot_file::AbstractString, dc_folder::AbstractString, s
         attrs(of)["level_high"] = level_high
         attrs(of)["E_end"]      = float(E_end)
         attrs(of)["n_E_total"]  = n_E_total
+        attrs(of)["F_safe"]     = float(F_safe)
         attrs(of)["nthreads"]   = Threads.nthreads()  # M_bh is per-snapshot (see each group)
 
         for (i, key) in enumerate(snap_keys)

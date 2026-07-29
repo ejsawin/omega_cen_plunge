@@ -29,6 +29,12 @@ global psi_tot_tab::Vector{Float64}
 global M_tab::Vector{Float64}
 global psi_Mtot::Float64
 
+# MC step-size safety factor: each mc_step covers N = max(1, N_safe) orbits with
+# N_safe = (1/F_safe) * min(t_gwE/period, sqrt(t_jj/period)). Larger F_safe -> smaller
+# steps. Typed global (read in the mc_step hot loop, so must NOT be a bare `Any` global);
+# default 10, overridable via automate_mc(...; F_safe = ...) for convergence tests.
+F_safe::Float64 = 10.0
+
 const b = 3*pi/16 # Normalized to Virial radius
 
 # Model-dependent constants. These are TYPED globals (mutable but type-stable): the
