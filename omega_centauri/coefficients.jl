@@ -384,6 +384,92 @@ function coef_grid(E_tab,j_tab,res)
     return DE1_tab, DE2_tab, Dj1_tab, Dj2_tab, DEE_tab, Djj_tab, DEj_tab
 end
 
+
+# ======================================================================================
+# DIAGNOSTIC: fully decompose the first-order J drift Dj1 into the INDIVIDUAL terms of its
+# (E,L)->(E,j) transform (Eq 1.73/1.74):
+#   Dj1_1 = Dj1_1_1 + Dj1_1_2 + Dj1_1_3   (three terms)
+#   Dj1_2 = Dj1_2_1 + Dj1_2_2             (two terms)
+#   Dj1   = Dj1_1 + Dj1_2
+# Lc(E) derivatives use finite differences (the cubic-spline comparison showed the spline
+# makes no difference, so it is dropped here). Not used by production (generate_coeffs);
+# driven only by run_dj1_decomp.jl.
+# ======================================================================================
+function avg_coef_ej_decomp(E, j)
+    Jc = find_Lc(E)[2]
+    J  = j * Jc
+
+    # Raw orbit-averaged (E,L) coefficients (the expensive part).
+    DE1_L, DE2_L, DL1_L, DL2_L, DEE_L, DLL_L, DEL_L = avg_coef_el(E, J)
+
+    # Lc(E) derivatives (finite difference).
+    dJc  = dLc_dE_fd(E)
+    d2Jc = d2Lc_dE2_fd(E)
+
+    # Dj1_1 (Eq 1.73), three terms:
+    Dj1_1_1 = DL1_L / Jc                                 # angular-momentum drift, DL1/Jc
+    Dj1_1_2 = -(J/(Jc^2)) * dJc * DE1_L                  # E-drift through the moving ceiling Lc(E)
+    Dj1_1_3 = -(1/(Jc^2)) * dJc * DEL_L                  # E-L cross diffusion via the j tilt
+    Dj1_1   = Dj1_1_1 + Dj1_1_2 + Dj1_1_3
+
+    # Dj1_2 (Eq 1.74), two terms (the Ito/curvature drift, split by Lc-derivative order):
+    Dj1_2_1 = -(J/2) * (d2Jc/(Jc^2)) * DEE_L             # d2Lc/dE2 term
+    Dj1_2_2 = -(J/2) * (-(2*(dJc^2))/(Jc^3)) * DEE_L     # (dLc/dE)^2 term = +(J*dJc^2/Jc^3)*DEE_L
+    Dj1_2   = Dj1_2_1 + Dj1_2_2
+
+    Dj1 = Dj1_1 + Dj1_2
+
+    return (Jc = Jc, J = J,
+            DE1_L = DE1_L, DL1_L = DL1_L, DEE_L = DEE_L, DEL_L = DEL_L,
+            dJc = dJc, d2Jc = d2Jc,
+            Dj1_1_1 = Dj1_1_1, Dj1_1_2 = Dj1_1_2, Dj1_1_3 = Dj1_1_3, Dj1_1 = Dj1_1,
+            Dj1_2_1 = Dj1_2_1, Dj1_2_2 = Dj1_2_2, Dj1_2 = Dj1_2,
+            Dj1 = Dj1)
+end
+
+# Fields emitted per grid point (matrices are [j, E] = [k, i], matching coef_grid).
+const DJ1_DECOMP_FIELDS = (:Jc, :J, :DE1_L, :DL1_L, :DEE_L, :DEL_L, :dJc, :d2Jc,
+                           :Dj1_1_1, :Dj1_1_2, :Dj1_1_3, :Dj1_1,
+                           :Dj1_2_1, :Dj1_2_2, :Dj1_2, :Dj1)
+
+function coef_grid_decomp(E_tab, j_tab, res)
+    out = Dict{Symbol,Matrix{Float64}}(f => zeros(res, res) for f in DJ1_DECOMP_FIELDS)
+    done = Threads.Atomic{Int}(0)
+    Threads.@threads for i in 1:res            # threads write disjoint E-columns -> no race
+        E = E_tab[i]
+        for k in 1:res
+            r = avg_coef_ej_decomp(E, j_tab[k])
+            for f in DJ1_DECOMP_FIELDS
+                @inbounds out[f][k, i] = getproperty(r, f)
+            end
+        end
+        d = Threads.atomic_add!(done, 1) + 1
+        d % 10 == 0 && (println("  coef_grid_decomp: $d / $res E-columns done"); flush(stdout))
+    end
+    return out
+end
+
+# Set up the SAME grid as generate_coeffs (from the active DF/potential globals) and run the
+# term decomposition. Returns (E_tab, j_tab, grids).
+function generate_dj1_decomp(res)
+    VEL_INT_TABLES[] = build_vel_int_tables(DF)
+    EE = 0.5 .* (dat.vr .^ 2 .+ dat.vt .^ 2) .+ psi_calc.(dat.r)
+    emin, emax = extrema(EE[(EE .< 0) .& (dat.startype .> -100)])
+
+    j_min = 1e-6; j_max = 0.999
+    j_edges = 10 .^ range(log10(j_min), log10(j_max), length = res + 1)
+    j_tab   = sqrt.(j_edges[1:end-1] .* j_edges[2:end])
+    E_abs_edges = 10 .^ range(log10(abs(emax)), log10(abs(emin)), length = res + 1)
+    E_tab   = reverse(-sqrt.(E_abs_edges[1:end-1] .* E_abs_edges[2:end]))
+
+    println("generate_dj1_decomp: res = $res, E in [$(E_tab[1]), $(E_tab[end])], " *
+            "j in [$(j_tab[1]), $(j_tab[end])]")
+    flush(stdout)
+    grids = coef_grid_decomp(E_tab, j_tab, res)
+    return (E_tab = E_tab, j_tab = j_tab, emin = emin, emax = emax, grids = grids)
+end
+
+
 struct DiffusionCoeffs
 
     # Orbit-averaged diff coeff grids

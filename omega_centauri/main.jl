@@ -24,15 +24,16 @@ include("gw.jl")
 include("monte_carlo.jl")
 include("orbits.jl")
 include("gw_experiment.jl")
+include("automation.jl") # automate_dc: snapshot -> diffusion-coefficient pipeline
 
 # Read in file
 #dat = read_file("omegaCenEddieNew.csv")
 #dat = read_file("~/ToProject/Omega_Cen_Plunge/1Gyr.csv")
 #dat = read_file_h5("/proj/rodriguezlab/projects/omega_cen/final_models/fb_0.02/N11e6_MBH5e2_RV5_gamma_3_alpha3_2.5_fb_0.02/output.window.snapshots.h5", "10(t=1.0002531Gyr)")
 #dat = read_file_h5("/proj/rodriguezlab/projects/omega_cen/final_models/fb_0.02/N11e6_MBH5e2_RV5_gamma_3_alpha3_2.5_fb_0.02/output.window.snapshots.h5", "25(t=12.005126Gyr)")
-dat = read_file_h5("/proj/rodriguezlab/projects/Big_Cluster/10_1000_timesteplim/output_10_1000_timesteplim_2.window.snapshots.h5", "9(t=1.0000013Gyr)")
+#dat = read_file_h5("/proj/rodriguezlab/projects/Big_Cluster/10_1000_timesteplim/output_10_1000_timesteplim_2.window.snapshots.h5", "9(t=1.0000013Gyr)")
 
-
+#=
 psi_tab, psi_tot_tab, M_tab = find_psi_arrays(dat.r,dat.m)
 psi_rtab = dat.r            # active potential grid (switch via activate_orbit_psi!)
 psi_Mtot = sum(dat.m)       # total stellar mass on the potential grid
@@ -52,4 +53,5 @@ m_obj = 5e-6
 rho = rho_calc(DF,dat)
 
 # Read in diffusion coefficients
-coef = load_coeffs("IMBH01_1dot00Gyr_powerlaw.hdf5")
+coef = load_coeffs("DC_1dot00Gyr_powerlaw.hdf5")
+=#

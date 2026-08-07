@@ -130,17 +130,125 @@ function find_Lc(E)
     return rsol, sqrt(Lc2) # rc, Lc
 end
 
-## Finite difference derivatives for (E,L) -> (E,j) ##
-# Relative step: an absolute one is noise-dominated for deeply bound E and can
-# push E across 0 (unbound) for weakly bound E.
-function dLc_dE(E)
+## Lc(E) derivatives for the (E,L) -> (E,j) coefficient transform (Dj1 etc.) ##
+#
+# Two backends, selected by the LC_DERIV_MODE flag (default :fd = the original behavior):
+#   :fd     -- 3-point finite differences of find_Lc (ORIGINAL; production default).
+#   :spline -- analytic derivatives of a natural cubic spline fit to Lc(E) (see the spline
+#              block at the bottom of this file). Motivation: d2Lc_dE2 by finite difference
+#              amplifies the interpolation kinks in find_Lc by ~1/eps^2, which is a prime
+#              suspect for the jagged sign-change / "hook" feature in the Dj1 map. The
+#              spline smooths Lc(E) first, so its 2nd derivative is clean. Diagnostic /
+#              opt-in only -- flip via set_Lc_deriv_mode!(:spline) after build_Lc_spline!.
+#
+# Finite-difference step is relative: an absolute one is noise-dominated for deeply bound E
+# and can push E across 0 (unbound) for weakly bound E.
+function dLc_dE_fd(E)
     eps_E = 1e-4 * abs(E)
     return (find_Lc(E+eps_E)[2]-find_Lc(E-eps_E)[2])/(2*eps_E)
 end
 
-function d2Lc_dE2(E)
+function d2Lc_dE2_fd(E)
     eps_E = 1e-4 * abs(E)
     return (find_Lc(E+eps_E)[2]+find_Lc(E-eps_E)[2]-2*find_Lc(E)[2])/(eps_E^2)
+end
+
+# Spline backend: analytic 1st/2nd derivatives of the cached Lc(E) spline (LC_SPLINE).
+function dLc_dE_spline(E)
+    sp = LC_SPLINE[]
+    sp === nothing && error("dLc_dE_spline: LC_SPLINE not built; call build_Lc_spline! first.")
+    return spline_d1(sp, E)
+end
+function d2Lc_dE2_spline(E)
+    sp = LC_SPLINE[]
+    sp === nothing && error("d2Lc_dE2_spline: LC_SPLINE not built; call build_Lc_spline! first.")
+    return spline_d2(sp, E)
+end
+
+# Flag-dispatched public API (call sites: avg_coef_ej, mc_drift). Default :fd reproduces
+# the original finite-difference behavior exactly.
+dLc_dE(E)   = LC_DERIV_MODE === :spline ? dLc_dE_spline(E)   : dLc_dE_fd(E)
+d2Lc_dE2(E) = LC_DERIV_MODE === :spline ? d2Lc_dE2_spline(E) : d2Lc_dE2_fd(E)
+
+
+# ======================================================================================
+# Natural cubic spline of Lc(E) (diagnostic / opt-in backend for the derivatives above).
+# Pure-Julia, no external deps. Numerical-Recipes tridiagonal solve; value/1st/2nd deriv.
+# ======================================================================================
+struct CubicSpline
+    x::Vector{Float64}    # knots, strictly ascending
+    y::Vector{Float64}    # values
+    y2::Vector{Float64}   # second derivatives at knots (natural BC: y2[1]=y2[end]=0)
+end
+
+function CubicSpline(x::AbstractVector{<:Real}, y::AbstractVector{<:Real})
+    n = length(x)
+    (n == length(y) && n >= 3) || error("CubicSpline: need matching lengths and >= 3 knots.")
+    xx = collect(float.(x)); yy = collect(float.(y))
+    u  = zeros(n); y2 = zeros(n)          # natural BC -> y2[1] = u[1] = 0
+    @inbounds for i in 2:n-1
+        sig = (xx[i]-xx[i-1]) / (xx[i+1]-xx[i-1])
+        p   = sig*y2[i-1] + 2.0
+        y2[i] = (sig-1.0)/p
+        ui  = (yy[i+1]-yy[i])/(xx[i+1]-xx[i]) - (yy[i]-yy[i-1])/(xx[i]-xx[i-1])
+        u[i] = (6.0*ui/(xx[i+1]-xx[i-1]) - sig*u[i-1]) / p
+    end
+    y2[n] = 0.0
+    @inbounds for k in n-1:-1:1
+        y2[k] = y2[k]*y2[k+1] + u[k]
+    end
+    return CubicSpline(xx, yy, y2)
+end
+
+@inline function _spline_klo(sp::CubicSpline, t::Real)
+    t <= sp.x[1]   && return 1
+    t >= sp.x[end] && return length(sp.x) - 1     # clamp; extrapolates on the end cubic
+    return searchsortedlast(sp.x, t)              # x[klo] <= t <= x[klo+1]
+end
+
+function spline_val(sp::CubicSpline, t::Real)     # value
+    klo = _spline_klo(sp, t); khi = klo+1
+    h = sp.x[khi]-sp.x[klo]; a = (sp.x[khi]-t)/h; b = (t-sp.x[klo])/h
+    return a*sp.y[klo] + b*sp.y[khi] + ((a^3-a)*sp.y2[klo] + (b^3-b)*sp.y2[khi])*h^2/6
+end
+
+function spline_d1(sp::CubicSpline, t::Real)      # first derivative
+    klo = _spline_klo(sp, t); khi = klo+1
+    h = sp.x[khi]-sp.x[klo]; a = (sp.x[khi]-t)/h; b = (t-sp.x[klo])/h
+    return (sp.y[khi]-sp.y[klo])/h + (-(3a^2-1)*sp.y2[klo] + (3b^2-1)*sp.y2[khi])*h/6
+end
+
+function spline_d2(sp::CubicSpline, t::Real)      # second derivative (linear in each panel)
+    klo = _spline_klo(sp, t); khi = klo+1
+    h = sp.x[khi]-sp.x[klo]; a = (sp.x[khi]-t)/h; b = (t-sp.x[klo])/h
+    return a*sp.y2[klo] + b*sp.y2[khi]
+end
+
+# Cached Lc(E) spline + the derivative-mode flag. LC_DERIV_MODE is a typed global (read in
+# dLc_dE, i.e. avg_coef_ej / mc_drift -- not the MC hot loop, but typed for consistency).
+const LC_SPLINE = Ref{Union{Nothing,CubicSpline}}(nothing)
+LC_DERIV_MODE::Symbol = :fd     # :fd (finite diff, PRODUCTION DEFAULT) or :spline
+
+# Sample Lc(E) on a dense log-|E| grid over [E_lo, E_hi] (both < 0) and spline it, so the
+# spline backend has smooth analytic dLc/dE, d2Lc/dE2. Call before set_Lc_deriv_mode!(:spline).
+function build_Lc_spline!(E_lo::Real, E_hi::Real; n::Integer = 4000)
+    (E_lo < 0 && E_hi < 0) || error("build_Lc_spline!: E_lo, E_hi must be < 0.")
+    aE = 10 .^ range(log10(min(abs(E_lo), abs(E_hi))), log10(max(abs(E_lo), abs(E_hi))), length = n)
+    Egrid  = sort(-aE)                                  # ascending E
+    Lcgrid = [find_Lc(E)[2] for E in Egrid]
+    LC_SPLINE[] = CubicSpline(Egrid, Lcgrid)
+    println(">>> build_Lc_spline!: $n knots, E in [$(Egrid[1]), $(Egrid[end])], " *
+            "Lc in [$(minimum(Lcgrid)), $(maximum(Lcgrid))]")
+    flush(stdout)
+    return nothing
+end
+
+function set_Lc_deriv_mode!(mode::Symbol)
+    mode in (:fd, :spline) || error("set_Lc_deriv_mode!: mode must be :fd or :spline.")
+    global LC_DERIV_MODE = mode
+    println(">>> LC_DERIV_MODE = $mode   (Lc(E) derivatives used in the (E,L)->(E,j) transform)")
+    flush(stdout)
+    return nothing
 end
 
 

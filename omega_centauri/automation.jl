@@ -473,3 +473,224 @@ function automate_mc(snapshot_file::AbstractString, dc_folder::AbstractString, s
     println("automate_mc: complete -> $(basename(out_file))")
     return out_file
 end
+
+
+# --- Record the BH population per snapshot, binned by mass --- #
+#
+# For each snapshot (spaced ~`sep` Gyr): read the compound table and count black holes
+# (startype == `bh_startype`, default 14) into mass bins. m_MSUN is already in solar masses,
+# so no conv.sh / mass conversion is needed. No potential / DF / coefficients -- this is
+# purely I/O + a per-particle count, so one job sweeps a whole (large) snapshot file.
+#
+# Output: <out_folder>/<name_prefix>_bh_population<suffix>.h5 with flat 1-D arrays:
+#   time     -- snapshot time [Gyr]                              (length = #snapshots)
+#   counts   -- [nbin, #snapshots] BH counts per mass bin
+#   n_total  -- total BHs per snapshot
+#   n_<tag>  -- per-bin counts as named 1-D arrays (e.g. n_lt10, n_10_20, n_20_30, n_ge30)
+# `mass_edges` (default [0,10,20,30,Inf] Msun) is stored as a root attribute; bins are
+# left-inclusive (matching numpy.histogram), so a mass of exactly 10 goes into 10-20.
+function automate_bh_population(snapshot_file::AbstractString, sep::Real,
+                               out_folder::AbstractString, name_prefix::AbstractString;
+                               mass_edges::Vector{<:Real} = [0.0, 10.0, 20.0, 30.0, Inf],
+                               bh_startype::Integer = 14,
+                               timeinterval::Union{Nothing, Tuple{Real,Real}} = nothing)
+
+    snapshot_file = expanduser(snapshot_file)
+    out_folder    = expanduser(out_folder)
+    isdir(out_folder) || mkpath(out_folder)
+
+    snap_keys = snapshot_keys_by_time(snapshot_file; sep = sep)
+    snap_keys, isuffix = _apply_time_interval(snap_keys, sep, timeinterval)
+    nsnap = length(snap_keys)
+    nbin  = length(mass_edges) - 1
+
+    out_file = joinpath(out_folder, "$(name_prefix)_bh_population$(isuffix).h5")
+
+    # Human-readable per-bin tags (lt10 / 10_20 / 20_30 / ge30 style) from the edges.
+    bin_tag(lo, hi) = lo == 0 ? "lt$(Int(hi))" :
+                      isinf(hi) ? "ge$(Int(lo))" : "$(Int(lo))_$(Int(hi))"
+    tags = [bin_tag(mass_edges[b], mass_edges[b+1]) for b in 1:nbin]
+
+    println("automate_bh_population: $nsnap snapshots (sep = $sep Gyr), $nbin mass bins" *
+            (timeinterval === nothing ? "" : "  [interval $(timeinterval[1])-$(timeinterval[2]) Gyr]"))
+    println("  snapshots: $snapshot_file")
+    println("  bh_startype = $bh_startype, mass_edges (Msun) = $mass_edges  -> bins $tags")
+    println("  output: $out_file")
+    flush(stdout)
+
+    times  = fill(NaN, nsnap)
+    counts = zeros(Int, nbin, nsnap)     # [bin, snapshot]
+    totals = fill(-1, nsnap)             # -1 marks a snapshot that failed / was not processed
+
+    h5open(snapshot_file, "r") do f
+        for (i, key) in enumerate(snap_keys)
+            t_gyr = _snapshot_time(key)
+            println("[$i/$nsnap] $key  (t = $t_gyr Gyr)")
+            flush(stdout)
+            try
+                rows = read(f[key])                     # one snapshot's compound table (~GB)
+                cbin = zeros(Int, nbin)
+                ntot = 0
+                @inbounds for row in rows
+                    row.startype == bh_startype || continue
+                    ntot += 1
+                    b = searchsortedlast(mass_edges, row.m_MSUN)
+                    (1 <= b <= nbin) && (cbin[b] += 1)
+                end
+                times[i]     = t_gyr
+                counts[:, i] = cbin
+                totals[i]    = ntot
+                println("    BHs = $ntot,  per-bin $tags = $cbin")
+                flush(stdout)
+                rows = nothing; GC.gc()                 # free the ~GB compound before the next
+            catch err
+                err isa InterruptException && rethrow()
+                println(stderr, "automate_bh_population: FAILED on $key (t = $t_gyr Gyr): $err")
+                flush(stderr)
+            end
+        end
+    end
+
+    h5open(out_file, "w") do of
+        attrs(of)["snapshot_file"] = snapshot_file
+        attrs(of)["sep"]         = float(sep)
+        attrs(of)["bh_startype"] = bh_startype
+        attrs(of)["mass_edges"]  = collect(float.(mass_edges))
+        attrs(of)["bin_tags"]    = tags
+        of["time"]    = times           # Gyr (NaN for any failed snapshot)
+        of["counts"]  = counts          # [nbin, nsnap]
+        of["n_total"] = totals          # -1 for any failed snapshot
+        for b in 1:nbin
+            of["n_$(tags[b])"] = counts[b, :]
+        end
+    end
+
+    println("automate_bh_population: complete -> $(basename(out_file))")
+    return out_file
+end
+
+
+# --- Record CMC IMBH-BH mergers (inspirals) per snapshot interval, binned by mass --- #
+#
+# Reads the CMC bhlosscone.dat merger log (small text file, NOT the 150 GB snapshots) and,
+# for each snapshot interval [t_k, t_{k+1}) (spaced ~sep Gyr), counts the IMBH-BH mergers --
+# rows with Outcome == `outcome` ("Inspiral") and kstar0 == `bh_kstar` (14) -- into mass bins
+# by the merging BH mass m0[MSUN]. The count is attributed to the snapshot at the START of the
+# interval (snapshot t_k records mergers in [t_k, t_{k+1})); mergers before the first snapshot
+# are dropped, since EPIC's baseline IS that first snapshot as-is. TotalTime is in CODE time
+# units -> Myr via `timeunitsmyr` (from conv.sh; not hardcoded). Fast: reads a ~MB log + the
+# snapshot KEYS only.
+#
+# Output: <out_folder>/<name_prefix>_cmc_mergers<suffix>.h5:
+#   time      -- snapshot time [Gyr]                          (length = #snapshots)
+#   counts    -- [nbin, #snapshots] IMBH-BH mergers per bin, per interval
+#   mass_sum  -- [nbin, #snapshots] summed merging-BH mass [Msun] per bin, per interval
+#   n_total   -- total IMBH-BH mergers per interval
+#   n_<tag>   -- per-bin counts as named 1-D arrays (n_lt10, n_10_20, n_20_30, n_ge30)
+function automate_cmc_mergers(snapshot_file::AbstractString, bhlosscone_path::AbstractString,
+                             sep::Real, out_folder::AbstractString, name_prefix::AbstractString;
+                             conv_path::AbstractString,
+                             mass_edges::Vector{<:Real} = [0.0, 10.0, 20.0, 30.0, Inf],
+                             bh_kstar::Integer = 14, outcome::AbstractString = "Inspiral",
+                             timeinterval::Union{Nothing, Tuple{Real,Real}} = nothing)
+
+    snapshot_file   = expanduser(snapshot_file)
+    bhlosscone_path = expanduser(bhlosscone_path)
+    out_folder      = expanduser(out_folder)
+    isdir(out_folder) || mkpath(out_folder)
+
+    set_model_constants!(conv_path)      # sets timeunitsmyr (TotalTime [code] -> Myr)
+
+    snap_keys = snapshot_keys_by_time(snapshot_file; sep = sep)
+    snap_keys, isuffix = _apply_time_interval(snap_keys, sep, timeinterval)
+    snap_times = Float64[_snapshot_time(k) for k in snap_keys]        # Gyr, ascending
+    nsnap = length(snap_times)
+    nbin  = length(mass_edges) - 1
+    isempty(snap_times) && error("automate_cmc_mergers: no snapshots after filtering.")
+
+    edges_t = vcat(snap_times, snap_times[end] + sep)                 # interval edges [Gyr]
+
+    bin_tag(lo, hi) = lo == 0 ? "lt$(Int(hi))" :
+                      isinf(hi) ? "ge$(Int(lo))" : "$(Int(lo))_$(Int(hi))"
+    tags = [bin_tag(mass_edges[b], mass_edges[b+1]) for b in 1:nbin]
+
+    out_file = joinpath(out_folder, "$(name_prefix)_cmc_mergers$(isuffix).h5")
+
+    println("automate_cmc_mergers: $nsnap snapshot intervals (sep = $sep Gyr), $nbin mass bins" *
+            (timeinterval === nothing ? "" : "  [interval $(timeinterval[1])-$(timeinterval[2]) Gyr]"))
+    println("  bhlosscone: $bhlosscone_path")
+    println("  filter: Outcome == \"$outcome\" & kstar0 == $bh_kstar,  timeunitsmyr = $timeunitsmyr")
+    println("  output: $out_file")
+    flush(stdout)
+
+    # --- parse the bhlosscone header (#N:name) for the columns we need ---
+    lines = readlines(bhlosscone_path)
+    col = Dict{String,Int}()
+    data_start = length(lines) + 1
+    for (li, line) in enumerate(lines)
+        s = strip(line)
+        isempty(s) && continue
+        if startswith(s, "#")
+            for m in eachmatch(r"#(\d+):(\S+)", s)
+                col[m.captures[2]] = parse(Int, m.captures[1])
+            end
+        else
+            data_start = li
+            break
+        end
+    end
+    for c in ("TotalTime", "Outcome", "m0[MSUN]", "kstar0")
+        haskey(col, c) || error("automate_cmc_mergers: column '$c' not found in $bhlosscone_path")
+    end
+    i_t, i_out, i_m, i_k = col["TotalTime"], col["Outcome"], col["m0[MSUN]"], col["kstar0"]
+    ncol_need = max(i_t, i_out, i_m, i_k)
+
+    counts   = zeros(Int, nbin, nsnap)
+    mass_sum = zeros(Float64, nbin, nsnap)
+    n_seen = 0; n_binned = 0
+    for li in data_start:length(lines)
+        s = strip(lines[li])
+        isempty(s) && continue
+        f = split(s)
+        length(f) < ncol_need && continue
+        f[i_out] == outcome || continue
+        parse(Float64, f[i_k]) == bh_kstar || continue      # object 0 is a BH
+        n_seen += 1
+        t_gyr  = parse(Float64, f[i_t]) * timeunitsmyr / 1000.0
+        m_msun = parse(Float64, f[i_m])
+        k = searchsortedlast(edges_t, t_gyr)                 # which snapshot interval
+        (1 <= k <= nsnap) || continue                        # before first / after last snapshot
+        b = searchsortedlast(mass_edges, m_msun)
+        (1 <= b <= nbin) || continue
+        counts[b, k]   += 1
+        mass_sum[b, k] += m_msun
+        n_binned += 1
+    end
+
+    println("  IMBH-BH mergers: $n_seen matched, $n_binned binned within " *
+            "[$(round(snap_times[1], digits=3)), $(round(edges_t[end], digits=3))] Gyr")
+    flush(stdout)
+
+    h5open(out_file, "w") do of
+        attrs(of)["snapshot_file"]   = snapshot_file
+        attrs(of)["bhlosscone_file"] = bhlosscone_path
+        attrs(of)["sep"]          = float(sep)
+        attrs(of)["outcome"]      = outcome
+        attrs(of)["bh_kstar"]     = bh_kstar
+        attrs(of)["timeunitsmyr"] = timeunitsmyr
+        attrs(of)["mass_edges"]   = collect(float.(mass_edges))
+        attrs(of)["bin_tags"]     = tags
+        attrs(of)["note"]         = "IMBH-BH mergers (Outcome==$outcome & kstar0==$bh_kstar) per " *
+                                    "snapshot interval [t_k, t_{k+1}); attributed to snapshot t_k."
+        of["time"]     = snap_times          # Gyr
+        of["counts"]   = counts              # [nbin, nsnap] per-interval
+        of["mass_sum"] = mass_sum            # [nbin, nsnap] summed BH mass [Msun]
+        of["n_total"]  = vec(sum(counts, dims = 1))
+        for b in 1:nbin
+            of["n_$(tags[b])"] = counts[b, :]
+        end
+    end
+
+    println("automate_cmc_mergers: complete -> $(basename(out_file))")
+    return out_file
+end
