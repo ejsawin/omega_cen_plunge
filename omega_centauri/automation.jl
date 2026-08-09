@@ -639,6 +639,21 @@ function automate_cmc_mergers(snapshot_file::AbstractString, bhlosscone_path::Ab
             break
         end
     end
+    # Restarted CMC runs (e.g. output_..._2.bhlosscone.dat, split to change a flag mid-run)
+    # drop the header, so the file starts straight into data. If no header was found, assume
+    # the standard CMC bhlosscone columns (identical across models); data_start is already 1.
+    if isempty(col)
+        default_header = "#1:TotalTime #2:binflag #3:Outcome #4:MBH_m[MSUN] #5:r #6:id0 " *
+            "#7:id1 #8:m0[MSUN] #9:m1[MSUN] #10:rad0[RSUN] #11:rad1[RSUN] #12:rad0_c[RSUN] " *
+            "#13:rad1_c[RSUN] #14:kstar0 #15:kstar1 #16:a[AU] #17:e #18:rperi[RSUN] #19:v_0 " *
+            "#20:v_1 #21:v_2 #22:E #23:J #24:Rdisr[RSUN] #25:r_disr_flag #26:nsteps #27:Porb #28:t_step"
+        for m in eachmatch(r"#(\d+):(\S+)", default_header)
+            col[m.captures[2]] = parse(Int, m.captures[1])
+        end
+        println(stderr, "automate_cmc_mergers: no header in $(basename(bhlosscone_path)) " *
+                "(restarted run?) -- assuming the standard CMC bhlosscone columns.")
+        flush(stderr)
+    end
     for c in ("TotalTime", "Outcome", "m0[MSUN]", "kstar0")
         haskey(col, c) || error("automate_cmc_mergers: column '$c' not found in $bhlosscone_path")
     end
