@@ -305,8 +305,12 @@ end
 # plus the FULL per-step trajectory of every walker that ended in the loss cone (reason 1),
 # under a `traj/<k>` subgroup keyed by the walker's 1-based position.
 # Output: <dc_folder>/<prefix>_mc.h5, one group per snapshot.
-#   method = 1 : no coefficient extrapolation (assume no diffusion below the data)
+# Out-of-grid coefficient handling (no consensus on the right physical rule, so these bracket
+# the uncertainty). j ALWAYS clamps to the nearest j-edge (a small/near-radial j keeps
+# diffusing toward the loss cone); only the E behavior differs by method:
+#   method = 1 : 0 when E is outside the grid, but nearest-j clamp in j
 #   method = 2 : power-law extrapolate over [ETab[level_low], ETab[level_high]] down to E_end
+#   method = 3 : nearest grid-edge value outside in both E and j (clamp)
 # max_t is in Myr (run_mc_rp_ra now converts to code units internally).
 function automate_mc(snapshot_file::AbstractString, dc_folder::AbstractString, sep::Real,
                      name_prefix::AbstractString, max_t::Real, max_steps::Integer;
@@ -389,11 +393,22 @@ function automate_mc(snapshot_file::AbstractString, dc_folder::AbstractString, s
                 activate_orbit_psi!()
                 dat_s = read_file_h5(snapshot_file, key)
 
-                # Optional power-law extrapolation of the coefficients below the data.
-                if method == 2
+                # Out-of-grid coefficient behavior (the physical extrapolation is unknown, so
+                # these bracket it). j always clamps (small-j walkers keep diffusing to the
+                # loss cone); only the E behavior differs:
+                #   method 1 -> 0 when E is off the grid, clamp in j
+                #   method 2 -> power-law extrapolate the grid downward (below the data in E)
+                #   method 3 -> nearest grid-edge value outside in both E and j (clamp)
+                if method == 1
+                    coef = set_extrap_boundary(coef, :zero)
+                elseif method == 2
                     ETab_s = sort(0.5 .* (dat_s.vr .^ 2 .+ dat_s.vt .^ 2) .+ psi_calc.(dat_s.r))
                     coef = extrapolate_coeffs(coef, ETab_s[level_low], ETab_s[level_high];
                         E_end = E_end, n_E_total = n_E_total, smooth_sigma = smooth_sigma)
+                elseif method == 3
+                    coef = set_extrap_boundary(coef, :clamp)
+                else
+                    error("automate_mc: method must be 1 (zero outside), 2 (power-law), or 3 (nearest/clamp)")
                 end
 
                 # One walker per bound BH/NS; integrate and keep the final state. For
@@ -411,9 +426,10 @@ function automate_mc(snapshot_file::AbstractString, dc_folder::AbstractString, s
                 traj_j  = Vector{Union{Nothing,Vector{Float64}}}(nothing, N)
                 traj_rp = Vector{Union{Nothing,Vector{Float64}}}(nothing, N)
                 traj_ra = Vector{Union{Nothing,Vector{Float64}}}(nothing, N)
+                traj_Egw = Vector{Union{Nothing,Vector{Float64}}}(nothing, N)
 
                 Threads.@threads :dynamic for k in 1:N
-                    ts, es, js, rps, ras, reason =
+                    ts, es, js, rps, ras, reason, egws =
                         run_mc_rp_ra(ics.E0[k], ics.J0[k], coef, ics.m0[k];
                                      max_step = max_steps, max_t = max_t,
                                      compute_rp_ra = compute_rp_ra)
@@ -422,7 +438,7 @@ function automate_mc(snapshot_file::AbstractString, dc_folder::AbstractString, s
                     reasons[k] = reason
                     if reason == 1   # entered loss cone -> retain the whole trajectory
                         traj_t[k]  = ts;  traj_E[k]  = es;  traj_j[k] = js
-                        traj_rp[k] = rps; traj_ra[k] = ras
+                        traj_rp[k] = rps; traj_ra[k] = ras; traj_Egw[k] = egws
                     end
                 end
 
@@ -440,7 +456,9 @@ function automate_mc(snapshot_file::AbstractString, dc_folder::AbstractString, s
                 # subgroup per such walker, keyed by its 1-based position k in
                 # indices/E0s/J0s/m0s. Arrays are per-MC-step (last entry = loss-cone
                 # crossing); t is in Myr (t_conv * code time), E/j the walker state,
-                # rp/ra peri/apocenter in code length units.
+                # rp/ra peri/apocenter in code length units, Egw the cumulative GW energy
+                # dissipated (specific, per unit mass; negative -- |value| is energy radiated;
+                # a large |Egw| flags a gradual EMRI-like inspiral vs a direct plunge).
                 tg = create_group(g, "traj")
                 ncap = 0
                 for k in 1:N
@@ -456,6 +474,7 @@ function automate_mc(snapshot_file::AbstractString, dc_folder::AbstractString, s
                     wk["j"]  = traj_j[k]
                     wk["rp"] = traj_rp[k]
                     wk["ra"] = traj_ra[k]
+                    wk["Egw"] = traj_Egw[k]
                 end
                 attrs(tg)["n_captured"] = ncap
                 flush(of)

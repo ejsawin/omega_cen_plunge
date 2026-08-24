@@ -11,7 +11,7 @@ function mc_step(E,j,coef,m_obj)
     if orbit_failed(rp, ra)
         # Return whatever your code uses to mark a terminated/rejected orbit.
         # Do not calculate a, e, period, or GW rates.
-        return -100.0, -100.0, 1000, 1000, false
+        return -100.0, -100.0, 1000, 1000, false, 0.0
     end
     
     a = (rp + ra) / 2
@@ -19,13 +19,13 @@ function mc_step(E,j,coef,m_obj)
     
     # Extra protection against bad elements.
     if !isfinite(a) || !isfinite(e) || a <= 0 || e < 0 || e >= 1
-        return -100.0, -100.0, 1000, 1000, false
+        return -100.0, -100.0, 1000, 1000, false, 0.0
     end
     
     period = find_period(E, L, rp, ra)   # reuse rp, ra from above (skips a 2nd find_rp_ra)
 
     if !isfinite(period) || period <= 0
-        return -100.0, -100.0, 1000, 1000, false
+        return -100.0, -100.0, 1000, 1000, false, 0.0
     end
     # (period, a, e are already set above -- the duplicate find_period/a/e recompute was
     #  removed; find_period does root-finding/integration, so this is one fewer per step.)
@@ -56,16 +56,29 @@ function mc_step(E,j,coef,m_obj)
     # Ignore degenerate L-diffusion timescales (t_jj = 0, Inf, or NaN -- e.g. djj_NR <= 0
     # off-grid, or j -> 0). The diffusion step is ill-defined there, so bail with the
     # sentinel; the furball / driver then drops this sample rather than guessing a step.
-    if !isfinite(t_jj) || t_jj <= 0.0
-        return -100.0, -100.0, 1000, 1000, false
+    # EXCEPTION (GW_ONLY, no-diffusion mode): djj_NR = 0 everywhere is intentional, so a
+    # t_jj = Inf means "L-diffusion does not constrain the step" (GW sets it) rather than a
+    # degenerate off-grid sample -- keep the walker instead of dropping it.
+    if (!isfinite(t_jj) || t_jj <= 0.0) && !(GW_ONLY && isinf(t_jj))
+        return -100.0, -100.0, 1000, 1000, false, 0.0
     end
 
     # Single step limiter (NO plunge branch): GW (t_gwE) and L-diffusion (t_jj) both cap
     # it. At least one full orbit, no upper cap -- the diffusion coeffs are orbit-averaged,
-    # so a sub-orbital step would misuse them.
+    # so a sub-orbital step would misuse them. When t_jj = Inf (GW_ONLY) L-diffusion drops
+    # out of the min and the GW timescale alone sets the step.
     plunge = t_gwE < period   # unused here; kept only for the commented-out pinhole block
-    N_safe = (1/F_safe) * min(t_gwE / period, sqrt(t_jj / period))
+    jj_lim = isfinite(t_jj) ? sqrt(t_jj / period) : Inf
+    N_safe = (1/F_safe) * min(t_gwE / period, jj_lim)
     dt = isfinite(N_safe) ? max(N_safe, 1.0) * period : period
+
+    # Deterministic GW energy drained this step: the GW E-rate (dE_GW, per unit time and
+    # specific in m_obj) times the actual step dt. Unlike the diffusion piece there is no
+    # stochastic term -- it is exactly dE_GW*dt regardless of the random kicks, and dt is
+    # the same dt the state update uses. The driver accumulates this into a per-step,
+    # cumulative "GW energy dissipated" trajectory (dE_GW < 0, so each contribution is
+    # negative; |cumsum| is the specific energy radiated -- no mass division, per request).
+    dEgw_step = dE_GW * dt
 
     denom = sqrt(abs(dEE_NR * djj_NR))
 
@@ -98,7 +111,7 @@ function mc_step(E,j,coef,m_obj)
     # E >= 0, find_Lc gives Lc -> 0 and j = L/Lc -> +-Inf, which must NOT be read as a
     # loss-cone capture. The driver logs this as escaped/unbound.
     if E_new >= 0.0
-        return E_new, j_new, dt, period, false
+        return E_new, j_new, dt, period, false, dEgw_step
     end
 
     rc_new, Lc_new = find_Lc(E_new)
@@ -152,7 +165,7 @@ function mc_step(E,j,coef,m_obj)
     =#
 
     # --- Naive treatment: continuous GW + direct loss-cone check every step ---
-    E_step = E_new + dE_GW * dt
+    E_step = E_new + dEgw_step        # dEgw_step == dE_GW * dt (the deterministic GW piece)
     L_step = L_new + dL_GW * dt
 
     rc_step, Lc_step = find_Lc(E_step)
@@ -166,7 +179,7 @@ function mc_step(E,j,coef,m_obj)
     # the walker as reason -100 -- rather than aliasing it into a merger, OR (as the plain
     # sentinel did) mislabeling this fly-away as an "uncharacterizable orbit".
     if !isfinite(j_step) || j_step < -1.0 || j_step > 2.0
-        return E_step, j_step, dt, period, false
+        return E_step, j_step, dt, period, false, dEgw_step
     end
 
     # Direct loss-cone capture: no dt/period probability, tested every step. Return the
@@ -174,10 +187,10 @@ function mc_step(E,j,coef,m_obj)
     # physical positive value) so the driver's log, the stored j, and its find_rp_ra
     # (L = j*Lc) all see j > 0 instead of a spurious negative.
     if reflect_j(j_step) <= loss_cone(E_step)
-        return E_step, reflect_j(j_step), dt, period, true
+        return E_step, reflect_j(j_step), dt, period, true, dEgw_step
     end
 
-    return E_step, j_step, dt, period, false
+    return E_step, j_step, dt, period, false, dEgw_step
 
 end
 
@@ -186,6 +199,11 @@ end
 ## there the `global` declaration makes every F_safe reference the global and the intended
 ## value is silently dropped. The argument here is named `x`, so there is no such clash.
 set_F_safe!(x::Real) = (global F_safe = float(x); return nothing)
+
+## Toggle GW-only (no-diffusion) mode the mc_step hot loop reads (see GW_ONLY in
+## constants.jl). Same rationale as set_F_safe! for using a helper: a bare
+## `global GW_ONLY = ...` from a scope with a local of that name silently no-ops.
+set_gw_only!(x::Bool) = (global GW_ONLY = x; return nothing)
 
 ## Reflecting boundary: single reflection at j = 0 and j = 1 (for j in [-1, 2]) ##
 function reflect_j(j)
@@ -266,14 +284,21 @@ function run_mc_rp_ra(E0, j0, coef, m_obj; max_step=100, max_t=Inf, compute_rp_r
     rp_stor = Vector{Float64}(undef, max_step + 1)
     ra_stor = Vector{Float64}(undef, max_step + 1)
 
+    # Cumulative GW energy dissipated (specific, per unit m_obj), one entry per stored step.
+    # Egw_stor[k] = sum over steps 1..k of dE_GW*dt (deterministic GW E-contribution); starts
+    # at 0 at the IC. Negative (GW removes orbital energy); |value| grows with radiated energy.
+    Egw_stor = Vector{Float64}(undef, max_step + 1)
+
     rc0, Lc0 = find_Lc(E0)
     rp_stor[1], ra_stor[1] = find_rp_ra(E0, j0*Lc0)
 
-    
+
     E_stor[1], j_stor[1], t_stor[1] = E0, j0, 0.0
+    Egw_stor[1] = 0.0
 
     # Initial values
     E, j, t = E0, j0, 0.0
+    Egw_cum = 0.0
     n = 1
     reason = 3   # default: reached max_step
 
@@ -283,7 +308,7 @@ function run_mc_rp_ra(E0, j0, coef, m_obj; max_step=100, max_t=Inf, compute_rp_r
         reason = 1
         println("Entered loss cone (j = $j, j_lc = $j_lc0, M = $m_obj)")
         return t_conv .* t_stor[1:n], E_stor[1:n], j_stor[1:n],
-               rp_stor[1:n], ra_stor[1:n], reason
+               rp_stor[1:n], ra_stor[1:n], reason, Egw_stor[1:n]
     end
 
     for step in 1:max_step
@@ -303,7 +328,7 @@ function run_mc_rp_ra(E0, j0, coef, m_obj; max_step=100, max_t=Inf, compute_rp_r
             break
         end
 
-        E_new, j_new, dt, P_orb, captured = mc_step(E,j,coef,m_obj)
+        E_new, j_new, dt, P_orb, captured, dEgw_step = mc_step(E,j,coef,m_obj)
 
         # mc_step could not characterize the orbit (find_rp_ra / find_period failed);
         # it returns the sentinel (-100, -100, 1000). Report the real (E, j).
@@ -321,6 +346,8 @@ function run_mc_rp_ra(E0, j0, coef, m_obj; max_step=100, max_t=Inf, compute_rp_r
             reason = 1
             n += 1
             E_stor[n], j_stor[n], t_stor[n] = E_new, j_new, t + dt
+            Egw_cum += dEgw_step
+            Egw_stor[n] = Egw_cum
             _, Lc_c = find_Lc(E_new)
             rp_stor[n], ra_stor[n] = find_rp_ra(E_new, j_new * Lc_c)
             println("Entered loss cone (j = $j_new, E = $E_new, M = $m_obj) at step $step")
@@ -357,9 +384,11 @@ function run_mc_rp_ra(E0, j0, coef, m_obj; max_step=100, max_t=Inf, compute_rp_r
         # orbit stays characterizable. The loss-cone capture is decided in mc_step.
         j = max(reflect_j(j_new), 0.1 * loss_cone(E_new), 1.0e-7)
         t += dt
+        Egw_cum += dEgw_step
         n += 1
 
         E_stor[n], j_stor[n], t_stor[n] = E, j, t
+        Egw_stor[n] = Egw_cum
         # Per-step rp/ra (find_Lc + find_rp_ra) is the dominant cost but only matters for
         # walkers that reach the loss cone. With compute_rp_ra=false skip it here (store NaN)
         # and backfill the captured trajectory after the loop.
@@ -392,7 +421,7 @@ function run_mc_rp_ra(E0, j0, coef, m_obj; max_step=100, max_t=Inf, compute_rp_r
         end
     end
 
-    return t_conv .* t_stor[1:n], E_stor[1:n], j_stor[1:n], rp_stor[1:n], ra_stor[1:n], reason
+    return t_conv .* t_stor[1:n], E_stor[1:n], j_stor[1:n], rp_stor[1:n], ra_stor[1:n], reason, Egw_stor[1:n]
 end
 
 

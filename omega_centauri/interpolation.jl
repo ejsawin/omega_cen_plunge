@@ -71,6 +71,39 @@ function bilinear_interp_clamped(x, y, x_grid, y_grid, f_grid)
     end
 end
 
+## Bilinear interp: clamp x to the grid (nearest-edge), but return 0 if y is off its grid. ##
+# For the (E,j) diffusion-coefficient samplers the closure is itp(j, E, j_tab, E_tab, Z), so
+# x = j and y = E: clamp in j (a very small / near-radial j takes the nearest j-edge value, so
+# a walker there keeps diffusing toward the loss cone instead of freezing) but return 0 when E
+# leaves the data range (method 1's "no diffusion beyond the E grid"). Assumes ascending grids.
+function bilinear_interp_clampj_zeroE(x, y, x_grid, y_grid, f_grid)
+    ny = length(y_grid)
+    if y < y_grid[1] || y > y_grid[end]        # E off the grid -> no diffusion
+        return 0.0
+    end
+    nx = length(x_grid)
+    xc = clamp(x, x_grid[1], x_grid[end])      # clamp j (nearest-edge)
+    ix = clamp(searchsortedlast(x_grid, xc), 1, nx - 1)
+    iy = clamp(searchsortedlast(y_grid, y),  1, ny - 1)
+
+    @inbounds begin
+        x1, x2 = x_grid[ix], x_grid[ix + 1]
+        y1, y2 = y_grid[iy], y_grid[iy + 1]
+
+        f11 = f_grid[ix, iy]
+        f12 = f_grid[ix, iy + 1]
+        f21 = f_grid[ix + 1, iy]
+        f22 = f_grid[ix + 1, iy + 1]
+
+        denom = (x2 - x1) * (y2 - y1)
+
+        return ((x2 - xc) * (y2 - y) * f11 +
+                (x2 - xc) * (y - y1) * f12 +
+                (xc - x1) * (y2 - y) * f21 +
+                (xc - x1) * (y - y1) * f22) / denom
+    end
+end
+
 ## 1D midpoint integration ##
 function midpoint(func,x_start,x_end,steps)
 

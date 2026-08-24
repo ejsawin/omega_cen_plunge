@@ -35,6 +35,14 @@ global psi_Mtot::Float64
 # default 10, overridable via automate_mc(...; F_safe = ...) for convergence tests.
 F_safe::Float64 = 10.0
 
+# GW-only (no-diffusion) mode. When true, mc_step does NOT bail when the L-diffusion
+# timescale is unconstrained (t_jj = j^2/djj_NR = Inf because djj_NR <= 0) -- it just lets
+# the GW timescale set the step. Used for zero-coefficient / GW-only tests (diffusion fully
+# off, so djj_NR is 0 everywhere and every non-captured walker would otherwise be dropped).
+# Default false keeps the production behavior of dropping off-grid degenerate samples.
+# Typed global (read in the mc_step hot loop, so must NOT be a bare `Any` global).
+GW_ONLY::Bool = false
+
 const b = 3*pi/16 # Normalized to Virial radius
 
 # Model-dependent constants. These are TYPED globals (mutable but type-stable): the

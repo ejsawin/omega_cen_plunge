@@ -584,3 +584,27 @@ function load_coeffs(name::String)
             interp(DEj_tab))
     end
 end
+
+## Rebuild a DiffusionCoeffs' sampler closures with a chosen out-of-grid behavior, WITHOUT
+## changing the grid. Used to select the MC extrapolation method for a query outside the
+## coefficient grid (the physical extrapolation rule is unknown, so we bracket it). Note the
+## J-axis ALWAYS clamps (a very small / near-radial j uses the nearest j-edge value, so those
+## walkers keep diffusing toward the loss cone); only the E-axis differs by method:
+##   boundary = :zero  -> 0 when E is outside the grid, clamp in j         (method 1)
+##   boundary = :clamp -> nearest grid-edge value in both E and j          (method 3;
+##                        this is also the generate_coeffs / load_coeffs default)
+## Method 2 instead EXTENDS the grid downward via extrapolate_coeffs (power law), so it is
+## not handled here.
+function set_extrap_boundary(dc::DiffusionCoeffs, boundary::Symbol)
+    boundary in (:zero, :clamp) || error("set_extrap_boundary: boundary must be :zero or :clamp")
+    itp = boundary === :zero ? bilinear_interp_clampj_zeroE : bilinear_interp_clamped
+    interp(Z) = (j, E) -> itp(j, E, dc.j_tab, dc.E_tab, Z)
+    return DiffusionCoeffs(
+        dc.DE1_tab, dc.DE2_tab, dc.Dj1_tab, dc.Dj2_tab,
+        dc.DEE_tab, dc.Djj_tab, dc.DEj_tab,
+        dc.E_tab, dc.j_tab, dc.emin, dc.emax,
+        interp(dc.DE1_tab), interp(dc.DE2_tab),
+        interp(dc.Dj1_tab), interp(dc.Dj2_tab),
+        interp(dc.DEE_tab), interp(dc.Djj_tab),
+        interp(dc.DEj_tab))
+end
