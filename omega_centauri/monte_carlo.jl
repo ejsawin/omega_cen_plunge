@@ -306,7 +306,7 @@ function run_mc_rp_ra(E0, j0, coef, m_obj; max_step=100, max_t=Inf, compute_rp_r
     j_lc0 = loss_cone(E)
     if j <= j_lc0
         reason = 1
-        println("Entered loss cone (j = $j, j_lc = $j_lc0, M = $m_obj)")
+        println("Entered loss cone (j = $j, j_lc = $j_lc0, M = $m_obj, Egw = $Egw_cum)")
         return t_conv .* t_stor[1:n], E_stor[1:n], j_stor[1:n],
                rp_stor[1:n], ra_stor[1:n], reason, Egw_stor[1:n]
     end
@@ -350,7 +350,7 @@ function run_mc_rp_ra(E0, j0, coef, m_obj; max_step=100, max_t=Inf, compute_rp_r
             Egw_stor[n] = Egw_cum
             _, Lc_c = find_Lc(E_new)
             rp_stor[n], ra_stor[n] = find_rp_ra(E_new, j_new * Lc_c)
-            println("Entered loss cone (j = $j_new, E = $E_new, M = $m_obj) at step $step")
+            println("Entered loss cone (j = $j_new, E = $E_new, M = $m_obj, Egw = $Egw_cum) at step $step")
             break
         end
 

@@ -80,8 +80,10 @@ end
 ## `time` is formatted with 2 decimals and a "dot" (e.g. 1.00 Gyr -> "IMBH01_1dot00Gyr").
 ## Reassigns the same globals main.jl uses; run it fresh (e.g. via run_automated_dc.jl).
 function automate_dc(filename::AbstractString, sep::Real, out_folder::AbstractString,
-                     name_prefix::AbstractString; centmass_path::AbstractString,
+                     name_prefix::AbstractString;
+                     centmass_path::Union{Nothing,AbstractString} = nothing,
                      conv_path::AbstractString, n_rv::Integer = 1000, grid_size::Integer = 200,
+                     M_bh_msun::Union{Nothing,Real} = nothing,
                      timeinterval::Union{Nothing, Tuple{Real,Real}} = nothing)
 
     global M_bh, dat, psi_tab, psi_tot_tab, M_tab, psi_rtab, psi_Mtot, psi_calc, ETab, DF
@@ -89,8 +91,17 @@ function automate_dc(filename::AbstractString, sep::Real, out_folder::AbstractSt
     filename = expanduser(filename)
     isdir(out_folder) || mkpath(out_folder)
 
-    # Model-dependent constants (c, t_conv, r_conv, timeunitsmyr) once per model.
+    # Model-dependent constants (c, t_conv, r_conv, timeunitsmyr, massunitmsun) once per model.
     set_model_constants!(conv_path)
+
+    # IMBH mass source: a constant override `M_bh_msun` (analytic runs, no centmass.dat) or
+    # per-snapshot from centmass.dat (CMC runs). The override takes precedence and converts
+    # Msun -> code units via massunitmsun (just set above); with M_bh_msun = nothing the CMC
+    # centmass path is used exactly as before. At least one must be provided.
+    M_bh_msun === nothing && centmass_path === nothing &&
+        error("automate_dc: provide centmass_path (CMC) or M_bh_msun (analytic).")
+    M_bh_msun === nothing ||
+        println("  constant IMBH override: M_bh = $M_bh_msun Msun (= $(M_bh_msun / massunitmsun) code units); centmass.dat not used.")
 
     snap_keys = snapshot_keys_by_time(filename; sep = sep)
     snap_keys, isuffix = _apply_time_interval(snap_keys, sep, timeinterval)
@@ -111,9 +122,11 @@ function automate_dc(filename::AbstractString, sep::Real, out_folder::AbstractSt
             flush(stdout)
 
             try
-                # Update the IMBH mass for this snapshot time (potential + coeffs use M_bh).
-                # centmass.dat times are in code time units -> convert with timeunitsmyr.
-                M_bh = get_MBH_mass(centmass_path, t_gyr * 1000.0, timeunitsmyr)
+                # IMBH mass (code units): constant override, or per-snapshot from centmass.dat
+                # (times there are code units -> Myr via timeunitsmyr). potential + coeffs use M_bh.
+                M_bh = M_bh_msun === nothing ?
+                       get_MBH_mass(centmass_path, t_gyr * 1000.0, timeunitsmyr) :
+                       M_bh_msun / massunitmsun
                 println("    M_bh = $M_bh (code units)")
                 flush(stdout)
 
@@ -314,9 +327,11 @@ end
 # max_t is in Myr (run_mc_rp_ra now converts to code units internally).
 function automate_mc(snapshot_file::AbstractString, dc_folder::AbstractString, sep::Real,
                      name_prefix::AbstractString, max_t::Real, max_steps::Integer;
-                     centmass_path::AbstractString, conv_path::AbstractString,
+                     centmass_path::Union{Nothing,AbstractString} = nothing,
+                     conv_path::AbstractString,
                      method::Integer = 2, level_low::Integer = 2, level_high::Integer = 11,
                      E_end::Real = -1.5e6, n_E_total::Integer = 300, smooth_sigma::Real = 2.0,
+                     M_bh_msun::Union{Nothing,Real} = nothing,
                      timeinterval::Union{Nothing, Tuple{Real,Real}} = nothing,
                      compute_rp_ra::Bool = false, F_safe::Real = 10,
                      out_prefix::AbstractString = name_prefix)
@@ -326,9 +341,17 @@ function automate_mc(snapshot_file::AbstractString, dc_folder::AbstractString, s
     snapshot_file = expanduser(snapshot_file)
     dc_folder     = expanduser(dc_folder)
 
-    # Model-dependent constants (c, t_conv, r_conv, timeunitsmyr) once per model. Must
-    # match what automate_dc used to build the coefficients/potential for this model.
+    # Model-dependent constants (c, t_conv, r_conv, timeunitsmyr, massunitmsun) once per model.
+    # Must match what automate_dc used to build the coefficients/potential for this model.
     set_model_constants!(conv_path)
+
+    # IMBH mass source (see automate_dc): constant override M_bh_msun (analytic, no centmass)
+    # takes precedence; else per-snapshot from centmass.dat. M_bh_msun = nothing keeps the CMC
+    # path unchanged. At least one is required.
+    M_bh_msun === nothing && centmass_path === nothing &&
+        error("automate_mc: provide centmass_path (CMC) or M_bh_msun (analytic).")
+    M_bh_msun === nothing ||
+        println("  constant IMBH override: M_bh = $M_bh_msun Msun (= $(M_bh_msun / massunitmsun) code units); centmass.dat not used.")
 
     # MC step-size safety factor read by mc_step (global). Set once here (the threaded
     # walker loop only reads it) so a convergence test can sweep it via
@@ -380,10 +403,12 @@ function automate_mc(snapshot_file::AbstractString, dc_folder::AbstractString, s
             end
 
             try
-                # IMBH mass for this snapshot time -- must match what automate_dc used, and
-                # feeds loss_cone / gw_rates / find_Lc and the psi IMBH term below.
-                # centmass.dat times are in code time units -> convert with timeunitsmyr.
-                M_bh = get_MBH_mass(centmass_path, t_gyr * 1000.0, timeunitsmyr)
+                # IMBH mass (code units): constant override or per-snapshot from centmass.dat.
+                # Feeds loss_cone / gw_rates / find_Lc and the psi IMBH term. Must match what
+                # automate_dc used. centmass.dat times are code units -> Myr via timeunitsmyr.
+                M_bh = M_bh_msun === nothing ?
+                       get_MBH_mass(centmass_path, t_gyr * 1000.0, timeunitsmyr) :
+                       M_bh_msun / massunitmsun
                 println("    M_bh = $M_bh (code units)")
                 flush(stdout)
 
@@ -479,7 +504,18 @@ function automate_mc(snapshot_file::AbstractString, dc_folder::AbstractString, s
                 attrs(tg)["n_captured"] = ncap
                 flush(of)
 
-                println("    $N walkers integrated")
+                # Per-snapshot GW-energy summary of the captures. |Egw| = cumulative GW
+                # energy radiated up to loss-cone crossing (large -> EMRI-like inspiral,
+                # small -> near-direct plunge); logged so the E_GW distribution is visible
+                # from the .out while the run is still going (before the .h5 is complete).
+                if ncap > 0
+                    aeg = abs.(Float64[traj_Egw[k][end] for k in 1:N if traj_Egw[k] !== nothing])
+                    lo, hi = extrema(aeg)
+                    println("    $N walkers integrated; $ncap captured, " *
+                            "|Egw| min/median/max = $lo / $(median(aeg)) / $hi")
+                else
+                    println("    $N walkers integrated; 0 captured")
+                end
                 flush(stdout)
             catch err
                 err isa InterruptException && rethrow()
