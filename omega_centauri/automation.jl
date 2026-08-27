@@ -324,6 +324,9 @@ end
 #   method = 1 : 0 when E is outside the grid, but nearest-j clamp in j
 #   method = 2 : power-law extrapolate over [ETab[level_low], ETab[level_high]] down to E_end
 #   method = 3 : nearest grid-edge value outside in both E and j (clamp)
+#   method = 4 : ANALYTIC Keplerian-cusp tail below ETab[level_low], down to the gravitational
+#                radius (E_end = -c^2/2). Fits gamma from THIS snapshot's mass (N) and mass^2 (F)
+#                density and builds the closed-form DF; the fitted gammas/amplitudes are logged.
 # max_t is in Myr (run_mc_rp_ra now converts to code units internally).
 function automate_mc(snapshot_file::AbstractString, dc_folder::AbstractString, sep::Real,
                      name_prefix::AbstractString, max_t::Real, max_steps::Integer;
@@ -418,12 +421,14 @@ function automate_mc(snapshot_file::AbstractString, dc_folder::AbstractString, s
                 activate_orbit_psi!()
                 dat_s = read_file_h5(snapshot_file, key)
 
-                # Out-of-grid coefficient behavior (the physical extrapolation is unknown, so
-                # these bracket it). j always clamps (small-j walkers keep diffusing to the
-                # loss cone); only the E behavior differs:
+                # Out-of-grid coefficient behavior. Methods 1-3 bracket the unknown physical rule;
+                # method 4 replaces the deep tail with the physically-motivated analytic cusp. j
+                # always clamps (small-j walkers keep diffusing to the loss cone); only the E
+                # behavior differs:
                 #   method 1 -> 0 when E is off the grid, clamp in j
                 #   method 2 -> power-law extrapolate the grid downward (below the data in E)
                 #   method 3 -> nearest grid-edge value outside in both E and j (clamp)
+                #   method 4 -> analytic Keplerian-cusp tail from fitted gamma_N / gamma_F
                 if method == 1
                     coef = set_extrap_boundary(coef, :zero)
                 elseif method == 2
@@ -432,8 +437,16 @@ function automate_mc(snapshot_file::AbstractString, dc_folder::AbstractString, s
                         E_end = E_end, n_E_total = n_E_total, smooth_sigma = smooth_sigma)
                 elseif method == 3
                     coef = set_extrap_boundary(coef, :clamp)
+                elseif method == 4
+                    # Splice at the 2nd-lowest particle (as method 2), then analytic tail down to
+                    # the gravitational radius r_g: E_end = -c^2/2, computed inside from the model c
+                    # (NOT the E_end kwarg, which is a method-1/2/3 concept). The fitted gamma_N /
+                    # gamma_F + amplitudes are printed to the log per snapshot (not saved to file).
+                    ETab_s = sort(0.5 .* (dat_s.vr .^ 2 .+ dat_s.vt .^ 2) .+ psi_calc.(dat_s.r))
+                    coef = extrapolate_coeffs_method4(coef, dat_s, M_bh, c, ETab_s[level_low];
+                        n_E_total = n_E_total)
                 else
-                    error("automate_mc: method must be 1 (zero outside), 2 (power-law), or 3 (nearest/clamp)")
+                    error("automate_mc: method must be 1 (zero), 2 (power-law), 3 (clamp), or 4 (analytic)")
                 end
 
                 # One walker per bound BH/NS; integrate and keep the final state. For

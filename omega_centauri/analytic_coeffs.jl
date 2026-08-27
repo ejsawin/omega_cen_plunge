@@ -238,3 +238,133 @@ function automate_analytic_mc(snapshot_file::AbstractString, conv_path::Abstract
     flush(stdout)
     return out_file
 end
+
+
+## Monte Carlo on the analytic snapshot using the *sampled* diffusion coefficients (the noisy
+## grid from automate_dc), NOT the analytic ground truth. This is the analytic-workflow twin of
+## automate_mc: it loads the ORBIT-SAMPLED potential the coefficients were built in (psi_file,
+## the *_rv_psi.h5) -- NOT a rebuilt Kepler psi -- and applies the SAME below-data extrapolation
+## methods as the CMC runs before integrating:
+##   method 1 : coefficients 0 when E is outside the grid (j still clamps to the nearest edge)
+##   method 2 : per-j power-law extrapolation over [ETab_s[level_low], ETab_s[level_high]] down
+##              to E_end (default; same params as run_automated_mc)
+##   method 3 : nearest grid-edge value outside in both E and j (clamp)
+## ETab_s (the fit-interval energies) is recomputed from the snapshot in the ACTIVE orbit-sampled
+## potential, exactly as automate_mc does -- so it is on the same energy scale as the coeff grid.
+## Takes explicit input paths (single snapshot) + M_bh_msun (IMBH not stored in the snapshot).
+## Output layout is identical to automate_mc / automate_analytic_mc. Heavy -> submit as a job.
+function automate_analytic_mc_sampled(snapshot_file::AbstractString, conv_path::AbstractString,
+                                      coeff_file::AbstractString, psi_file::AbstractString,
+                                      out_file::AbstractString;
+                                      M_bh_msun::Real, max_t::Real = 100.0,
+                                      max_steps::Integer = 100000, F_safe::Real = 10,
+                                      method::Integer = 2, level_low::Integer = 2,
+                                      level_high::Integer = 11, E_end::Real = -1.5e6,
+                                      n_E_total::Integer = 300, smooth_sigma::Real = 2.0,
+                                      compute_rp_ra::Bool = false)
+    global M_bh, dat
+
+    set_model_constants!(conv_path)                       # units (c, r_conv, massunitmsun, ...)
+    M_bh = M_bh_msun / massunitmsun                        # code units (IMBH not stored in snapshot)
+    set_F_safe!(F_safe)
+
+    key   = snapshot_keys_by_time(snapshot_file; sep = 0.1)[1]
+    t_gyr = _snapshot_time(key); tag = _time_tag(t_gyr)
+    dat   = read_file_h5(snapshot_file, key)
+
+    # Orbit-sampled potential the coefficients were built in (matches automate_mc; the IMBH
+    # point-mass term is baked into these tables at DC time). activate_orbit_psi! also rebinds
+    # the global psi_calc used just below for the method-2 fit energies.
+    load_orbit_psi!(psi_file)
+    activate_orbit_psi!()
+
+    coef = load_coeffs(coeff_file)                        # sampled coefficients (noisy grid)
+
+    # Below-data extrapolation, identical to automate_mc. j always clamps to the nearest edge;
+    # only the off-grid E behavior differs by method.
+    if method == 1
+        coef = set_extrap_boundary(coef, :zero)
+    elseif method == 2
+        ETab_s = sort(0.5 .* (dat.vr .^ 2 .+ dat.vt .^ 2) .+ psi_calc.(dat.r))
+        println("    method 2: fit [$(ETab_s[level_low]), $(ETab_s[level_high])] " *
+                "(ETab_s[$level_low], ETab_s[$level_high]) -> E_end = $E_end, n_E_total = $n_E_total")
+        coef = extrapolate_coeffs(coef, ETab_s[level_low], ETab_s[level_high];
+                                  E_end = E_end, n_E_total = n_E_total, smooth_sigma = smooth_sigma)
+    elseif method == 3
+        coef = set_extrap_boundary(coef, :clamp)
+    else
+        error("automate_analytic_mc_sampled: method must be 1 (zero), 2 (power-law), or 3 (clamp)")
+    end
+
+    ics = black_hole_ics(dat)
+    N   = length(ics.indices)
+    println("automate_analytic_mc_sampled: N = $N walkers, max_t = $max_t Myr, method = $method, " *
+            "F_safe = $F_safe, M_bh = $M_bh (code), coeff = $(basename(coeff_file))")
+    flush(stdout)
+
+    Ef  = Vector{Float64}(undef, N); jf  = Vector{Float64}(undef, N)
+    rpf = Vector{Float64}(undef, N); raf = Vector{Float64}(undef, N)
+    reasons = Vector{Int}(undef, N)
+    traj_t  = Vector{Union{Nothing,Vector{Float64}}}(nothing, N)
+    traj_E  = Vector{Union{Nothing,Vector{Float64}}}(nothing, N)
+    traj_j  = Vector{Union{Nothing,Vector{Float64}}}(nothing, N)
+    traj_rp = Vector{Union{Nothing,Vector{Float64}}}(nothing, N)
+    traj_ra = Vector{Union{Nothing,Vector{Float64}}}(nothing, N)
+    traj_Egw = Vector{Union{Nothing,Vector{Float64}}}(nothing, N)
+
+    Threads.@threads :dynamic for k in 1:N
+        ts, es, js, rps, ras, reason, egws =
+            run_mc_rp_ra(ics.E0[k], ics.J0[k], coef, ics.m0[k];
+                         max_step = max_steps, max_t = max_t, compute_rp_ra = compute_rp_ra)
+        Ef[k] = es[end]; jf[k] = js[end]; rpf[k] = rps[end]; raf[k] = ras[end]
+        reasons[k] = reason
+        if reason == 1
+            traj_t[k]  = ts;  traj_E[k]  = es;  traj_j[k] = js
+            traj_rp[k] = rps; traj_ra[k] = ras; traj_Egw[k] = egws
+        end
+    end
+
+    h5open(out_file, "w") do of
+        attrs(of)["snapshot_file"] = snapshot_file
+        attrs(of)["coeff_file"]    = coeff_file
+        attrs(of)["psi_file"]      = psi_file
+        attrs(of)["max_t"]         = float(max_t)
+        attrs(of)["max_steps"]     = max_steps
+        attrs(of)["method"]        = method
+        attrs(of)["level_low"]     = level_low
+        attrs(of)["level_high"]    = level_high
+        attrs(of)["E_end"]         = float(E_end)
+        attrs(of)["n_E_total"]     = n_E_total
+        attrs(of)["F_safe"]        = float(F_safe)
+        attrs(of)["M_bh"]          = M_bh
+        attrs(of)["nthreads"]      = Threads.nthreads()
+
+        g = create_group(of, "$(tag)Gyr")
+        attrs(g)["time"] = t_gyr; attrs(g)["M_bh"] = M_bh; attrs(g)["N"] = N
+        g["indices"] = ics.indices
+        g["E0s"] = ics.E0; g["J0s"] = ics.J0; g["m0s"] = ics.m0
+        g["Ef"]  = Ef;     g["jf"]  = jf
+        g["rpf"] = rpf;    g["raf"] = raf
+        g["reason_to_end"] = reasons
+
+        tg = create_group(g, "traj"); ncap = 0
+        for k in 1:N
+            traj_t[k] === nothing && continue
+            ncap += 1
+            wk = create_group(tg, string(k))
+            attrs(wk)["orig_index"] = ics.indices[k]
+            attrs(wk)["m"]  = ics.m0[k]
+            attrs(wk)["E0"] = ics.E0[k]
+            attrs(wk)["J0"] = ics.J0[k]
+            wk["t"]   = traj_t[k];  wk["E"]  = traj_E[k];  wk["j"] = traj_j[k]
+            wk["rp"]  = traj_rp[k]; wk["ra"] = traj_ra[k]; wk["Egw"] = traj_Egw[k]
+        end
+        attrs(tg)["n_captured"] = ncap
+        println("    $N walkers integrated; $ncap captured (reason 1)")
+        flush(stdout)
+    end
+
+    println("automate_analytic_mc_sampled: complete -> $out_file")
+    flush(stdout)
+    return out_file
+end

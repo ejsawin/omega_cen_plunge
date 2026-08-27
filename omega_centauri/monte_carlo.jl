@@ -238,6 +238,7 @@ function run_mc(E0, j0, coef, m_obj; max_step=100, max_t=Inf)
 
         if j <= j_lc
             println("Entered loss cone (j = $j, j_lc = $j_lc, M = $m_obj)")
+            flush(stdout)
             break
         elseif E >= 0.0 || t >= max_t_code
             break
@@ -307,6 +308,7 @@ function run_mc_rp_ra(E0, j0, coef, m_obj; max_step=100, max_t=Inf, compute_rp_r
     if j <= j_lc0
         reason = 1
         println("Entered loss cone (j = $j, j_lc = $j_lc0, M = $m_obj, Egw = $Egw_cum)")
+        flush(stdout)
         return t_conv .* t_stor[1:n], E_stor[1:n], j_stor[1:n],
                rp_stor[1:n], ra_stor[1:n], reason, Egw_stor[1:n]
     end
@@ -351,6 +353,7 @@ function run_mc_rp_ra(E0, j0, coef, m_obj; max_step=100, max_t=Inf, compute_rp_r
             _, Lc_c = find_Lc(E_new)
             rp_stor[n], ra_stor[n] = find_rp_ra(E_new, j_new * Lc_c)
             println("Entered loss cone (j = $j_new, E = $E_new, M = $m_obj, Egw = $Egw_cum) at step $step")
+            flush(stdout)
             break
         end
 
@@ -675,4 +678,201 @@ function black_hole_ics(dat; startypes = (14))
     end
 
     return (indices = inds, E0 = E0s, J0 = J0s, m0 = m0s)
+end
+
+
+# ============================================================================
+# METHOD 4: physically-motivated deep-E extrapolation of the diffusion coefficients.
+#
+# Peer to methods 1 (:zero), 2 (extrapolate_coeffs, power-law), 3 (:clamp). Instead of
+# guessing the coefficients below the innermost sampled particle, we exploit that this region
+# is deep inside the influence radius -> the potential is ~Keplerian and a relaxed cusp is a
+# power law. We fit the cusp from the snapshot and replace the deep tail with ANALYTIC
+# coefficients built from that fit (the same machinery validated by the analytic-sampling test).
+#
+# Two power-law slopes are fit (both feed the diffusion coefficients, see coefficients.jl):
+#   gamma_rho  from the MASS density   rho(r)   = A_rho r^-gamma_rho   -> DF.N (friction: DE2/Dj2)
+#   gamma_F    from the MASS^2 density  rho2(r) = A_F   r^-gamma_F     -> DF.F (diffusion: DEE/Djj/DEj, DE1/Dj1)
+# In a single-mass cusp these coincide (F = m*N); under mass segregation gamma_F (BH-dominated)
+# is steeper and is the one that actually drives loss-cone diffusion.
+# ============================================================================
+
+## Beta B(a,b) via midpoint quadrature (no SpecialFunctions dep; distinct name from _beta). ##
+function _beta_pl(a::Real, b::Real; n::Integer = 40000)
+    s = 0.0; h = 1.0 / n
+    @inbounds for i in 1:n
+        x = (i - 0.5) * h
+        s += x^(a - 1) * (1 - x)^(b - 1)
+    end
+    return s * h
+end
+
+## Fit a power-law density rho_w(r) = A r^(-gamma) to weighted particles over [r_lo, r_hi].
+## `weights` = masses for the mass density (first moment), masses.^2 for the mass^2 density
+## (second moment). Bins particles in log r, forms the shell density per bin, and does a
+## count-weighted log-log least-squares fit (same estimator as the analytic-sampling density
+## plot). Returns (gamma, A) in the SAME (code) units as r and the weights. ##
+function fit_powerlaw_density(rs::AbstractVector, weights::AbstractVector,
+                              r_lo::Real, r_hi::Real; nbins::Integer = 18)
+    r_lo > 0 && r_hi > r_lo || error("fit_powerlaw_density: need 0 < r_lo < r_hi (got $r_lo, $r_hi)")
+    edges = 10.0 .^ range(log10(r_lo), log10(r_hi), length = nbins + 1)
+    vol   = (4pi / 3) .* (edges[2:end] .^ 3 .- edges[1:end-1] .^ 3)   # shell volumes
+    wsum  = zeros(nbins); cnt = zeros(Int, nbins)
+    @inbounds for i in eachindex(rs)
+        r = rs[i]
+        (r < r_lo || r >= r_hi) && continue
+        b = searchsortedlast(edges, r)
+        (1 <= b <= nbins) || continue
+        wsum[b] += weights[i]; cnt[b] += 1
+    end
+    good = (cnt .> 0) .& (wsum .> 0)
+    count(good) >= 3 || error("fit_powerlaw_density: <3 populated bins in [$r_lo, $r_hi]; " *
+                              "widen the range or lower nbins (got $(count(good)))")
+    rc   = sqrt.(edges[1:end-1] .* edges[2:end])[good]        # geometric bin centers
+    rho  = (wsum ./ vol)[good]
+    w    = Float64.(cnt[good])                                 # count-weighted fit
+    lx = log10.(rc); ly = log10.(rho)
+    xb = sum(w .* lx) / sum(w); yb = sum(w .* ly) / sum(w)
+    slope = sum(w .* (lx .- xb) .* (ly .- yb)) / sum(w .* (lx .- xb) .^ 2)
+    gamma = -slope
+    A = 10.0 ^ (yb - slope * xb)
+    return gamma, A
+end
+
+## Two-moment analytic DF (as a SampDF) for a Keplerian power-law cusp: tabn from (A_rho,
+## gamma_rho), tabf INDEPENDENTLY from (A_F, gamma_F). Each is the closed-form Eddington DF of
+## a power law in a Kepler potential: N_log = K r^3 v^3 eps^(gamma-3/2), eps = M_bh/r - v^2/2
+## (code, G=1), K = (2 sqrt(2) pi / B(gamma-1/2, 3/2)) * A * M_bh^(-gamma). Grid spans [r_lo,
+## r_hi] with v up to ~v_esc(r_lo). ##
+function build_powerlaw_df_two_moment(gamma_rho::Real, A_rho::Real, gamma_F::Real, A_F::Real,
+                                      M_bh_code::Real, r_lo::Real, r_hi::Real;
+                                      nr::Integer = 600, nv::Integer = 600)
+    p_rho = gamma_rho - 1.5; p_F = gamma_F - 1.5
+    K_rho = (2 * sqrt(2) * pi / _beta_pl(p_rho + 1, 1.5)) * A_rho * M_bh_code ^ (-gamma_rho)
+    K_F   = (2 * sqrt(2) * pi / _beta_pl(p_F   + 1, 1.5)) * A_F   * M_bh_code ^ (-gamma_F)
+
+    v_hi = sqrt(2 * M_bh_code / r_lo); v_lo = v_hi / 1.0e5
+    logr = collect(range(log(r_lo), log(r_hi), length = nr))
+    logv = collect(range(log(v_lo), log(v_hi), length = nv))
+    tabn = zeros(nr, nv); tabf = zeros(nr, nv)
+    @inbounds for i in 1:nr
+        r = exp(logr[i])
+        for k in 1:nv
+            v = exp(logv[k])
+            eps = M_bh_code / r - 0.5 * v^2
+            if eps > 0.0
+                rv3 = r^3 * v^3
+                tabn[i, k] = K_rho * rv3 * eps^p_rho
+                tabf[i, k] = K_F   * rv3 * eps^p_F
+            end
+        end
+    end
+    Nfun = (lr, lv) -> bilinear_interp(lr, lv, logr, logv, tabn)
+    Ffun = (lr, lv) -> bilinear_interp(lr, lv, logr, logv, tabf)
+    return SampDF(logr, logv, tabn, tabf, Nfun, Ffun)
+end
+
+## Method 4 extrapolation: keep the sampled coefficient rows at E >= E_fit_deep (identical to
+## method 2's kept region) and replace the deep tail (down to E_end) with analytic coefficients.
+## Builds the SAME n_E_total E-axis as extrapolate_coeffs, so a method-2 and a method-4 grid
+## differ ONLY in the tail. Requires the SAMPLED orbit potential to be active on entry (to
+## compute nothing here -- E_fit_deep is passed in, computed by the caller in that potential).
+## The analytic tail is evaluated in a pure-Kepler potential (rebuilt internally down to r_g/10)
+## with the two-moment fitted DF; the caller's potential + VEL_INT_TABLES are restored on exit.
+## `dat_s` = the snapshot (for the gamma fits + r_infl); `c_code` sets r_g and the default E_end.
+## Returns the method-4 DiffusionCoeffs. Fitted slopes are printed (verbose) for inspection.
+function extrapolate_coeffs_method4(coef::DiffusionCoeffs, dat_s, M_bh_code::Real, c_code::Real,
+                                    E_fit_deep::Real;
+                                    E_end::Real = -c_code^2 / 2, n_E_total::Integer = 300,
+                                    r_fit_hi_frac::Real = 0.1, r_fit_lo::Union{Nothing,Real} = nothing,
+                                    nr::Integer = 600, nv::Integer = 600, fit_nbins::Integer = 18,
+                                    verbose::Bool = true)
+
+    E_tab = collect(float.(coef.E_tab)); j_tab = collect(float.(coef.j_tab))
+    n_j = length(j_tab)
+    E_end < E_fit_deep || error("extrapolate_coeffs_method4: E_end ($E_end) must be below E_fit_deep ($E_fit_deep)")
+
+    # Kept (reliable) rows + deep tail energies -- IDENTICAL construction to extrapolate_coeffs.
+    keep_mask = E_tab .>= E_fit_deep
+    E_keep = E_tab[keep_mask]; n_keep = length(E_keep)
+    n_keep > 0 || error("extrapolate_coeffs_method4: no grid rows at/above E_fit_deep = $E_fit_deep")
+    n_tail = n_E_total - n_keep
+    n_tail >= 1 || error("extrapolate_coeffs_method4: n_E_total ($n_E_total) <= kept rows ($n_keep)")
+    E_tail = -exp10.(range(log10(abs(E_end)), log10(abs(E_keep[1])), length = n_tail + 1))[1:end-1]
+    E_new  = vcat(E_tail, E_keep)
+
+    # Influence radius (where enclosed STELLAR mass = M_bh) + two-slope cusp fit over [r_lo, 0.1 r_infl].
+    _, _, M_tab_s = find_psi_arrays(dat_s.r, dat_s.m)
+    idx    = clamp(searchsortedfirst(view(M_tab_s, 1:length(dat_s.r)), M_bh_code), 1, length(dat_s.r))
+    r_infl = dat_s.r[idx]
+    r_hi   = r_fit_hi_frac * r_infl
+    r_lo   = r_fit_lo === nothing ? minimum(dat_s.r) : r_fit_lo
+    gamma_rho, A_rho = fit_powerlaw_density(dat_s.r, dat_s.m,       r_lo, r_hi; nbins = fit_nbins)
+    gamma_F,  A_F    = fit_powerlaw_density(dat_s.r, dat_s.m .^ 2,  r_lo, r_hi; nbins = fit_nbins)
+
+    r_g = M_bh_code / c_code^2
+    if verbose
+        println("  [method4] r_infl = $r_infl (code),  fit range [$r_lo, $r_hi] = [min r, $(r_fit_hi_frac) r_infl]")
+        println("  [method4] mass density    : gamma_rho = $(round(gamma_rho, digits=4)),  A_rho = $A_rho")
+        println("  [method4] mass^2 density   : gamma_F   = $(round(gamma_F,  digits=4)),  A_F   = $A_F")
+        println("  [method4] r_g = $r_g,  E_end = $E_end  (= -c^2/2, circular energy at r_g; c = $c_code)")
+        println("  [method4] keep $n_keep sampled rows (E >= $E_fit_deep); analytic tail = $n_tail rows down to E_end")
+        flush(stdout)
+    end
+
+    # --- analytic tail in a pure-Kepler potential; restore the caller's state afterwards ---
+    saved_psi = ORBIT_PSI[]; saved_vit = VEL_INT_TABLES[]
+    # r-range spanning the tail orbits: from below r_g out past the shallowest tail apocenter
+    # (~2*a for the least-bound tail energy; use a generous 10*a = 5*M_bh/|E_keep[1]|).
+    r_span_lo = r_g / 10
+    r_span_hi = 5 * M_bh_code / abs(E_keep[1])
+    tail_mats = try
+        rgrid = 10.0 .^ range(log10(r_span_lo), log10(r_span_hi), length = 6000)
+        kpsi, ktot, kM = find_psi_arrays(rgrid, zeros(length(rgrid)))
+        ORBIT_PSI[] = (r = rgrid, psi_tab = kpsi, psi_tot = ktot, M_tab = kM,
+                       psi_calc = psi_exact(rgrid, kpsi, kM))
+        activate_orbit_psi!()
+
+        df = build_powerlaw_df_two_moment(gamma_rho, A_rho, gamma_F, A_F, M_bh_code,
+                                          r_span_lo, r_span_hi; nr = nr, nv = nv)
+        VEL_INT_TABLES[] = build_vel_int_tables(df)   # cou_log from global M_bh/dat (matches sampled)
+
+        DE1t = zeros(n_j, n_tail); DE2t = zeros(n_j, n_tail); Dj1t = zeros(n_j, n_tail)
+        Dj2t = zeros(n_j, n_tail); DEEt = zeros(n_j, n_tail); Djjt = zeros(n_j, n_tail)
+        DEjt = zeros(n_j, n_tail)
+        Threads.@threads for i in 1:n_tail
+            E = E_tail[i]
+            for k in 1:n_j
+                d1, d2, jj1, jj2, ee, jj, ej = avg_coef_ej(E, j_tab[k])
+                @inbounds begin
+                    DE1t[k, i] = d1; DE2t[k, i] = d2; Dj1t[k, i] = jj1; Dj2t[k, i] = jj2
+                    DEEt[k, i] = ee; Djjt[k, i] = jj; DEjt[k, i] = ej
+                end
+            end
+        end
+        (DE1t, DE2t, Dj1t, Dj2t, DEEt, Djjt, DEjt)
+    finally
+        if saved_psi !== nothing
+            ORBIT_PSI[] = saved_psi; activate_orbit_psi!()
+        end
+        VEL_INT_TABLES[] = saved_vit
+    end
+
+    # Assemble: analytic tail (cols 1:n_tail) + kept sampled rows (cols n_tail+1:end).
+    sampled = (coef.DE1_tab, coef.DE2_tab, coef.Dj1_tab, coef.Dj2_tab,
+               coef.DEE_tab, coef.Djj_tab, coef.DEj_tab)
+    out = Matrix{Float64}[]
+    for (Msamp, Mtail) in zip(sampled, tail_mats)
+        Mn = Matrix{Float64}(undef, n_j, n_E_total)
+        Mn[:, 1:n_tail]         = Mtail
+        Mn[:, (n_tail + 1):end] = Msamp[:, keep_mask]
+        push!(out, Mn)
+    end
+
+    DE1, DE2, Dj1, Dj2, DEE, Djj, DEj = out
+    interp(Z) = (j, E) -> bilinear_interp_clamped(j, E, j_tab, E_new, Z)
+    return DiffusionCoeffs(DE1, DE2, Dj1, Dj2, DEE, Djj, DEj,
+        E_new, j_tab, E_new[1], coef.emax,
+        interp(DE1), interp(DE2), interp(Dj1), interp(Dj2),
+        interp(DEE), interp(Djj), interp(DEj))
 end
