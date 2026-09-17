@@ -327,6 +327,11 @@ end
 #   method = 4 : ANALYTIC Keplerian-cusp tail below ETab[level_low], down to the gravitational
 #                radius (E_end = -c^2/2). Fits gamma from THIS snapshot's mass (N) and mass^2 (F)
 #                density and builds the closed-form DF; the fitted gammas/amplitudes are logged.
+#   method = 5 : as method 1 (zero outside), but below ETab[level_low] the coefficients vanish,
+#                so the evolution there is purely deterministic GW inspiral. Those walkers are
+#                exempted from max_t (they use `max_t_free`, Inf by default) because their
+#                merger is already certain and only its TIME is unknown; max_step still caps
+#                them. The zero-diffusion t_jj = Inf bail in mc_step is lifted there as well.
 # max_t is in Myr (run_mc_rp_ra now converts to code units internally).
 function automate_mc(snapshot_file::AbstractString, dc_folder::AbstractString, sep::Real,
                      name_prefix::AbstractString, max_t::Real, max_steps::Integer;
@@ -334,6 +339,7 @@ function automate_mc(snapshot_file::AbstractString, dc_folder::AbstractString, s
                      conv_path::AbstractString,
                      method::Integer = 2, level_low::Integer = 2, level_high::Integer = 11,
                      E_end::Real = -1.5e6, n_E_total::Integer = 300, smooth_sigma::Real = 2.0,
+                     max_t_free::Real = Inf,
                      M_bh_msun::Union{Nothing,Real} = nothing,
                      timeinterval::Union{Nothing, Tuple{Real,Real}} = nothing,
                      compute_rp_ra::Bool = false, F_safe::Real = 10,
@@ -387,6 +393,7 @@ function automate_mc(snapshot_file::AbstractString, dc_folder::AbstractString, s
         attrs(of)["level_high"] = level_high
         attrs(of)["E_end"]      = float(E_end)
         attrs(of)["n_E_total"]  = n_E_total
+        attrs(of)["max_t_free"] = float(max_t_free)   # method 5: time limit below the threshold
         attrs(of)["F_safe"]     = float(F_safe)
         attrs(of)["nthreads"]   = Threads.nthreads()  # M_bh is per-snapshot (see each group)
 
@@ -420,6 +427,7 @@ function automate_mc(snapshot_file::AbstractString, dc_folder::AbstractString, s
                 load_orbit_psi!(psi_file)
                 activate_orbit_psi!()
                 dat_s = read_file_h5(snapshot_file, key)
+                global dat = dat_s   # method 4's build_vel_int_tables reads global `dat` for cou_log
 
                 # Out-of-grid coefficient behavior. Methods 1-3 bracket the unknown physical rule;
                 # method 4 replaces the deep tail with the physically-motivated analytic cusp. j
@@ -429,8 +437,26 @@ function automate_mc(snapshot_file::AbstractString, dc_folder::AbstractString, s
                 #   method 2 -> power-law extrapolate the grid downward (below the data in E)
                 #   method 3 -> nearest grid-edge value outside in both E and j (clamp)
                 #   method 4 -> analytic Keplerian-cusp tail from fitted gamma_N / gamma_F
+                #   method 5 -> as method 1, but max_t is lifted below the threshold
+                E_free = -Inf     # method 5 only; -Inf leaves every other method unchanged
                 if method == 1
                     coef = set_extrap_boundary(coef, :zero)
+                elseif method == 5
+                    # Method 5 = method 1 (zero outside) with one change: below the threshold
+                    # the coefficients vanish, so the evolution there is purely deterministic
+                    # GW inspiral. The outcome is already decided and only the merger TIME is
+                    # unknown, so cutting those walkers off at max_t would discard mergers that
+                    # are certain to happen. Below E_free they instead run to max_t_free
+                    # (Inf by default), with max_step as the backstop. Passing E_free into
+                    # mc_step also lifts the t_jj = Inf bail there, which would otherwise kill
+                    # the walker (reason -100) the moment it crossed -- the same zero-diffusion
+                    # degeneracy that GW_ONLY mode exists to handle.
+                    ETab_s = sort(0.5 .* (dat_s.vr .^ 2 .+ dat_s.vt .^ 2) .+ psi_calc.(dat_s.r))
+                    E_free = ETab_s[level_low]
+                    coef = set_extrap_boundary(coef, :zero)
+                    println("    method 5: zero below E = $E_free (ETab_s[$level_low]); " *
+                            "max_t lifted there (max_t_free = $max_t_free Myr)")
+                    flush(stdout)
                 elseif method == 2
                     ETab_s = sort(0.5 .* (dat_s.vr .^ 2 .+ dat_s.vt .^ 2) .+ psi_calc.(dat_s.r))
                     coef = extrapolate_coeffs(coef, ETab_s[level_low], ETab_s[level_high];
@@ -446,7 +472,8 @@ function automate_mc(snapshot_file::AbstractString, dc_folder::AbstractString, s
                     coef = extrapolate_coeffs_method4(coef, dat_s, M_bh, c, ETab_s[level_low];
                         n_E_total = n_E_total)
                 else
-                    error("automate_mc: method must be 1 (zero), 2 (power-law), 3 (clamp), or 4 (analytic)")
+                    error("automate_mc: method must be 1 (zero), 2 (power-law), 3 (clamp), " *
+                          "4 (analytic), or 5 (zero + no time limit below the threshold)")
                 end
 
                 # One walker per bound BH/NS; integrate and keep the final state. For
@@ -470,7 +497,8 @@ function automate_mc(snapshot_file::AbstractString, dc_folder::AbstractString, s
                     ts, es, js, rps, ras, reason, egws =
                         run_mc_rp_ra(ics.E0[k], ics.J0[k], coef, ics.m0[k];
                                      max_step = max_steps, max_t = max_t,
-                                     compute_rp_ra = compute_rp_ra)
+                                     compute_rp_ra = compute_rp_ra,
+                                     E_free = E_free, max_t_free = float(max_t_free))
                     Ef[k] = es[end]; jf[k] = js[end]
                     rpf[k] = rps[end]; raf[k] = ras[end]
                     reasons[k] = reason
