@@ -1,9 +1,9 @@
 # --- Monte Carlo Functions --- #
 
 ## `E_free`: energies at or below this are treated as a GW-only regime -- the diffusion
-## coefficients vanish there (method 5), so an unconstrained L-diffusion timescale is
-## EXPECTED rather than a degenerate sample and must not bail. Default -Inf disables it,
-## leaving methods 1-4 bit-identical.
+## coefficients vanish there (method 1, below the grid), so an unconstrained L-diffusion
+## timescale is EXPECTED rather than a degenerate sample and must not bail. Default -Inf
+## disables it, leaving methods 2/3/4 bit-identical.
 function mc_step(E, j, coef, m_obj; E_free::Float64 = -Inf)
 
     # Characterize orbit 
@@ -63,7 +63,7 @@ function mc_step(E, j, coef, m_obj; E_free::Float64 = -Inf)
     # EXCEPTION (GW_ONLY, no-diffusion mode): djj_NR = 0 everywhere is intentional, so a
     # t_jj = Inf means "L-diffusion does not constrain the step" (GW sets it) rather than a
     # degenerate off-grid sample -- keep the walker instead of dropping it.
-    # SAME EXCEPTION, energy-gated (method 5): below E_free the coefficients are zero by
+    # SAME EXCEPTION, energy-gated (method 1): below E_free the coefficients are zero by
     # construction, so t_jj = Inf there is the intended GW-only regime, not a bad sample.
     if (!isfinite(t_jj) || t_jj <= 0.0) && !((GW_ONLY || E <= E_free) && isinf(t_jj))
         return -100.0, -100.0, 1000, 1000, false, 0.0
@@ -279,18 +279,16 @@ end
 # captured walker is set at the crossing regardless, so its summary rpf/raf stays correct;
 # non-captured walkers get NaN rp/ra (discarded downstream).
 #
-# E_free / max_t_free (method 5): energies at or below `E_free` lie in the extrapolated
-# region where the diffusion coefficients are zero, so the evolution there is purely
-# deterministic GW inspiral -- the outcome is already fixed and only the time to merge is
-# unknown. Walkers in that regime use `max_t_free` (Myr, default Inf = no limit) instead of
-# `max_t`, so a certain merger is not discarded just because it finishes after the snapshot
-# interval. `max_step` remains the backstop. Defaults leave methods 1-4 bit-identical.
+# E_free: energies at or below this lie in the region where the diffusion coefficients are
+# ZERO (method 1, below the coefficient grid), so the only physics left there is
+# deterministic GW inspiral. It is forwarded to mc_step so that djj = 0 -> t_jj = Inf is
+# treated as "GW alone sets the step" instead of a degenerate sample. Default -Inf disables
+# it, leaving every other method bit-identical.
 function run_mc_rp_ra(E0, j0, coef, m_obj; max_step=100, max_t=Inf, compute_rp_ra=true,
-                      E_free::Float64 = -Inf, max_t_free::Float64 = Inf)
+                      E_free::Float64 = -Inf)
 
     # max_t is in Myr; the internal clock t is in code (Henon) units, so convert once.
-    max_t_code      = max_t / t_conv
-    max_t_free_code = max_t_free / t_conv
+    max_t_code = max_t / t_conv
 
     # Initialize storage arrays
     E_stor = Vector{Float64}(undef, max_step + 1)
@@ -340,7 +338,7 @@ function run_mc_rp_ra(E0, j0, coef, m_obj; max_step=100, max_t=Inf, compute_rp_r
             println(stderr, "REASON -100: escaped/unbound at loop top (E = $E) at step $step; ending walker early.")
             flush(stderr)
             break
-        elseif t >= (E <= E_free ? max_t_free_code : max_t_code)
+        elseif t >= max_t_code
             reason = 2
             break
         end
@@ -380,10 +378,8 @@ function run_mc_rp_ra(E0, j0, coef, m_obj; max_step=100, max_t=Inf, compute_rp_r
             break
         end
 
-        # Completing this step would pass the time limit: discard it and time out. Below
-        # E_free (method 5) the limit is max_t_free (Inf by default), so a GW-only walker
-        # is allowed to finish its inspiral past the end of the snapshot interval.
-        if t + dt > (E <= E_free ? max_t_free_code : max_t_code)
+        # Completing this step would pass max_t: discard it and time out.
+        if t + dt > max_t_code
             reason = 2
             break
         end
